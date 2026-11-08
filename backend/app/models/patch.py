@@ -48,3 +48,4 @@ class ValidationRun(Base):
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     patch = relationship("PatchProposal", back_populates="validation_runs")
+

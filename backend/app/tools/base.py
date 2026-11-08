@@ -45,3 +45,4 @@ class BaseDiagnosticTool(ABC):
     async def execute(self, project_path: str, arguments: Dict[str, Any]) -> ToolResult:
         """Execute the tool safely and return structured result."""
         pass
+

@@ -66,3 +66,4 @@ async def download_html_report(report_id: str, db: AsyncSession = Depends(get_db
             "Content-Disposition": f"attachment; filename=pipelinesleuth_report_{report.id}.html"
         }
     )
+

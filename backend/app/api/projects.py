@@ -65,3 +65,4 @@ async def upload_project_files(
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
+

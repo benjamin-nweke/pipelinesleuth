@@ -102,3 +102,4 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
         "recent_projects": recent_projects,
         "recent_events": recent_events
     }
+

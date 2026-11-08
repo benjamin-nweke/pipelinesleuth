@@ -37,3 +37,4 @@ class ConnectivityTestResult(BaseModel):
     model: str
     latency_ms: int
     message: str
+

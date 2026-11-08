@@ -137,3 +137,4 @@ async def test_connectivity(db: AsyncSession = Depends(get_db)):
         latency_ms=latency,
         message=message
     )
+

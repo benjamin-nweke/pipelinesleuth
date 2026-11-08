@@ -185,3 +185,4 @@ async def get_report(investigation_id: str, db: AsyncSession = Depends(get_db)):
     if not report:
         raise HTTPException(status_code=404, detail="Investigation report not generated yet.")
     return report
+

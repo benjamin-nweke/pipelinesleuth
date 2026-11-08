@@ -188,3 +188,4 @@ class InspectSchemaTool(BaseDiagnosticTool):
             summary=" ".join(summary_parts),
             execution_time_ms=int((time.time() - start_time) * 1000)
         )
+

@@ -16,3 +16,4 @@ KeyError: "Required column 'customer_id' missing from transaction dataset! Avail
 
 ## Expected Resolution
 The agent should identify the missing `customer_id` and the presence of `client_id` through `inspect_schema` or `analyze_logs`, propose mapping or normalizing `client_id` -> `customer_id` in `pipeline.py`, and validate that `test_pipeline.py` passes.
+

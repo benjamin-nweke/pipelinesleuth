@@ -490,3 +490,4 @@ propose a patch, or conclude the investigation. Output pure JSON.
             f"Final Report Generated: {title}",
             {"report_id": report.id, "root_cause": root_cause, "is_success": is_success}
         )
+

@@ -16,3 +16,4 @@ ValueError: could not convert string to float: 'pending'
 
 ## Expected Resolution
 The agent should inspect the log with `analyze_logs`, profile the dataset with `profile_dataset` to detect `mixed_type_or_dirty_strings` in column `amount`, inspect the AST with `inspect_code`, propose replacing `.astype(float)` with `pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)`, and validate that `test_pipeline.py` passes.
+

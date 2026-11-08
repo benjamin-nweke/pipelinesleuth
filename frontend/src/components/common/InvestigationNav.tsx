@@ -87,3 +87,4 @@ export const InvestigationNav: React.FC<InvestigationNavProps> = ({
     </div>
   );
 };
+

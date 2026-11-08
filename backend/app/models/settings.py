@@ -25,3 +25,4 @@ class ApplicationSettings(Base):
     sandbox_timeout_seconds = Column(Integer, default=60)
     extra_config = Column(JSON, default=dict)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+

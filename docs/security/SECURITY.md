@@ -39,3 +39,4 @@ When code must be executed for diagnostics or validation:
 - **No Prompt Injection Execution**: System instructions instruct the agent to treat data files and log traces as data, never as commands.
 - **Structured JSON Schema**: Model outputs are strictly validated through Pydantic (`AgentDecision`). Unrecognized tool names or arbitrary shell commands are rejected by the Tool Registry.
 - **Masked Credentials**: API keys are masked before persisting or sending to the frontend UI.
+

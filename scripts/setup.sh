@@ -45,3 +45,4 @@ echo "=========================================================="
 echo " PipelineSleuth setup complete!                           "
 echo " Start the application with: ./scripts/start.sh            "
 echo "=========================================================="
+

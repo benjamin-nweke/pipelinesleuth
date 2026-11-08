@@ -21,3 +21,4 @@ def test_calculate_customer_aggregates_with_null_handling():
     assert len(res) == 2
     c1_row = res[res["customer_id"] == "C1"].iloc[0]
     assert c1_row["total_amount"] == 100.0
+

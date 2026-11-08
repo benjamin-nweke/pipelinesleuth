@@ -165,3 +165,4 @@ export async function loadDemoScenario(key: string): Promise<Project> {
   if (!res.ok) throw new Error(`Failed to load demo scenario ${key}`);
   return res.json();
 }
+

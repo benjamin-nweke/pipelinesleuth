@@ -16,3 +16,4 @@ def test_parse_and_compute_revenue_with_non_numeric_strings():
     # After patch, gross revenue should be 150.0 (safely ignoring or zeroing unparsed strings)
     total = parse_and_compute_revenue(df)
     assert total == 150.0
+

@@ -90,3 +90,4 @@ class AgentDecision(BaseModel):
     
     confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Overall confidence in root cause diagnosis")
     confidence_justification: str = Field("", description="Why this confidence score is warranted by collected evidence")
+

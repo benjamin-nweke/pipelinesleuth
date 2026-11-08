@@ -174,3 +174,4 @@ The AI agent interacts with the codebase strictly through registered diagnostic 
 ## License
 
 Apache 2.0. Built for developers and data engineering teams who investigate pipeline failures.
+

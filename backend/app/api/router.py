@@ -16,3 +16,4 @@ api_router.include_router(investigations_router)
 api_router.include_router(settings_router)
 api_router.include_router(demos_router)
 api_router.include_router(reports_router)
+

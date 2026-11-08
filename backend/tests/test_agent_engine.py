@@ -273,3 +273,4 @@ async def test_missing_docker_security_boundary(test_session: AsyncSession):
     assert res["docker_available"] is False
     assert res["exit_code"] == -1
     assert "EXECUTION BLOCKED BY SECURITY POLICY" in res["stderr"]
+

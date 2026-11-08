@@ -199,3 +199,4 @@ class AnalyzeLogsTool(BaseDiagnosticTool):
             summary=summary,
             execution_time_ms=int((time.time() - start_time) * 1000)
         )
+

@@ -393,3 +393,4 @@ export const NewInvestigationPage: React.FC = () => {
     </div>
   );
 };
+

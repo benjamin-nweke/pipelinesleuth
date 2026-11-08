@@ -19,3 +19,4 @@ def test_transform_and_aggregate_with_legacy_and_drifted_columns():
     # Check spend
     c1_spend = summary[summary["customer_id"] == "C1"]["total_spend"].values[0]
     assert c1_spend == 25.0
+

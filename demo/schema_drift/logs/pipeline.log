@@ -9,3 +9,4 @@ Traceback (most recent call last):
   File "pipeline.py", line 18, in transform_and_aggregate
     raise KeyError(
 KeyError: "Required column 'customer_id' missing from transaction dataset! Available columns: ['client_id', 'amount', 'transaction_date', 'status']"
+

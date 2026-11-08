@@ -99,3 +99,4 @@ class ToolExecution(Base):
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     investigation = relationship("Investigation", back_populates="tool_executions")
+

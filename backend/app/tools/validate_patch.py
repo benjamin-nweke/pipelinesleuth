@@ -164,3 +164,4 @@ class ValidatePatchTool(BaseDiagnosticTool):
         finally:
             # 4. Clean up candidate workspace copy
             sandbox_manager.cleanup_workspace(candidate_ws)
+

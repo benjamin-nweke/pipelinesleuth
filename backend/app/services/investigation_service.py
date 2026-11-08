@@ -215,3 +215,4 @@ class InvestigationService:
 
 
 investigation_service = InvestigationService()
+

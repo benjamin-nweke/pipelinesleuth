@@ -67,3 +67,4 @@ ValueError: could not convert string to float: 'pending'
    amounts_numeric = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
    ```
 4. The user approves the patch; tests pass cleanly with exit code 0.
+

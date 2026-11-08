@@ -87,3 +87,4 @@ The relational SQLite schema maintains full traceability:
 - **`patch_proposals`**: Syntactically verified candidate patches with unified diffs and human approval status.
 - **`validation_runs`**: Real exit codes, test summaries, stdout, and stderr from candidate executions.
 - **`investigation_reports`**: Final synthesized reports ready for Markdown/HTML export.
+

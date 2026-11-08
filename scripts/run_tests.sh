@@ -16,3 +16,4 @@ echo " PipelineSleuth: Running Pytest Test Suite                "
 echo "=========================================================="
 
 pytest backend/tests -v
+

@@ -87,3 +87,4 @@ class RunDiagnosticTool(BaseDiagnosticTool):
             error=res.get("error"),
             execution_time_ms=res.get("execution_time_ms", int((time.time() - start_time) * 1000))
         )
+
