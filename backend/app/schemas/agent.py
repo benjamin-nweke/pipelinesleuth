@@ -1,0 +1,92 @@
+"""
+Structured Pydantic models for Agent Actions, Reasoning, and Decision Making
+"""
+from typing import Optional, List, Dict, Any, Literal
+from pydantic import BaseModel, Field
+
+
+class ToolCallRequest(BaseModel):
+    tool_name: str = Field(..., description="The name of the registered diagnostic tool to call")
+    arguments: Dict[str, Any] = Field(default_factory=dict, description="Arguments to pass to the tool")
+
+
+class AgentEvidenceInput(BaseModel):
+    source_file: str = Field(..., description="File path from which evidence was observed")
+    evidence_type: str = Field(..., description="Type of evidence e.g. schema_diff, dataset_anomaly, log_stacktrace, ast_pattern, diagnostic_output")
+    line_number: Optional[int] = Field(None, description="Relevant line number if applicable")
+    column_name: Optional[str] = Field(None, description="Relevant column name if applicable")
+    execution_stage: Optional[str] = Field(None, description="Pipeline stage name")
+    observation: str = Field(..., description="Factual observation derived directly from tool output")
+    associated_hypothesis_id: Optional[str] = Field(None, description="Hypothesis ID this evidence supports or addresses")
+
+
+class AgentHypothesisInput(BaseModel):
+    id: Optional[str] = Field(None, description="Hypothesis ID if updating an existing one, or leave null for new")
+    title: str = Field(..., description="Concise statement of the failure hypothesis")
+    description: str = Field(..., description="Detailed explanation of how the failure happens")
+    status: Literal["formulated", "testing", "confirmed", "rejected", "inconclusive"] = Field("formulated")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0")
+    reasoning: str = Field(..., description="Explicit justification for confidence and status based on evidence")
+
+
+class AgentPatchInput(BaseModel):
+    target_file: str = Field(..., description="Path to the file that requires modification")
+    original_code_context: str = Field(..., description="Original snippet of code being replaced")
+    proposed_code: str = Field(..., description="Replacement code snippet")
+    unified_diff: str = Field(..., description="Unified diff formatted representation of the patch")
+    explanation: str = Field(..., description="Detailed technical explanation of why this fix addresses root cause")
+    supporting_evidence_ids: List[str] = Field(default_factory=list, description="List of evidence IDs justifying this fix")
+    expected_impact: str = Field(..., description="Expected behavior of pipeline after fix")
+    potential_risks: str = Field(..., description="Potential edge cases, regressions or side effects")
+
+
+class AgentReportInput(BaseModel):
+    title: str = Field(..., description="Title of final diagnostic report")
+    summary: str = Field(..., description="Executive summary of the failure and investigation")
+    root_cause: str = Field(..., description="Definitive evidence-backed root cause statement")
+    affected_components: List[str] = Field(default_factory=list, description="Pipeline files and stages affected")
+    remaining_risks: Optional[str] = Field(None, description="Remaining uncertainty or operational risks")
+    next_steps: List[str] = Field(default_factory=list, description="Recommended production actions or monitoring")
+
+
+class AgentDecision(BaseModel):
+    """
+    Every reasoning turn of the agent outputs a structured AgentDecision.
+    The agent can:
+    1. Formulate / update hypotheses
+    2. Record traceable evidence
+    3. Call a diagnostic tool
+    4. Propose a patch
+    5. Conclude investigation with report or inconclusive verdict
+    """
+    thinking: str = Field(..., description="Internal chain of investigative reasoning and reflection on evidence")
+    current_stage: Literal[
+        "context_collection",
+        "artifact_inspection",
+        "failure_localization",
+        "hypothesis_generation",
+        "diagnostic_selection",
+        "evidence_collection",
+        "hypothesis_testing",
+        "root_cause_assessment",
+        "patch_generation",
+        "awaiting_approval",
+        "validation",
+        "regression_testing",
+        "report_generation"
+    ] = Field(..., description="Current stage in the investigation workflow")
+    
+    hypotheses: List[AgentHypothesisInput] = Field(default_factory=list, description="New or updated hypotheses")
+    new_evidence: List[AgentEvidenceInput] = Field(default_factory=list, description="Evidence facts to record from recent tool outputs")
+    
+    # Action selection: exactly one primary action per step
+    action_type: Literal["call_tool", "propose_patch", "conclude_success", "conclude_inconclusive", "request_info"] = Field(
+        ..., description="The next action to take"
+    )
+    
+    tool_call: Optional[ToolCallRequest] = Field(None, description="Tool to execute if action_type == 'call_tool'")
+    patch_proposal: Optional[AgentPatchInput] = Field(None, description="Patch details if action_type == 'propose_patch'")
+    final_report: Optional[AgentReportInput] = Field(None, description="Final report if concluding")
+    
+    confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Overall confidence in root cause diagnosis")
+    confidence_justification: str = Field("", description="Why this confidence score is warranted by collected evidence")

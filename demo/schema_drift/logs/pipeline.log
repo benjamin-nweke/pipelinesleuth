@@ -1,0 +1,11 @@
+2026-10-07 08:30:01 [INFO] Starting daily customer transaction aggregation pipeline
+2026-10-07 08:30:02 [STAGE: INGESTION] Loading transaction records from data/transactions.csv
+2026-10-07 08:30:02 [INFO] Ingested 6 records. Columns: ['client_id', 'amount', 'transaction_date', 'status']
+2026-10-07 08:30:02 [STAGE: TRANSFORMATION] Aggregating spend by customer_id
+2026-10-07 08:30:02 [FATAL ERROR] Pipeline terminated unexpectedly: KeyError: "Required column 'customer_id' missing from transaction dataset! Available columns: ['client_id', 'amount', 'transaction_date', 'status']"
+Traceback (most recent call last):
+  File "pipeline.py", line 32, in run_pipeline
+    summary_df = transform_and_aggregate(raw_df)
+  File "pipeline.py", line 18, in transform_and_aggregate
+    raise KeyError(
+KeyError: "Required column 'customer_id' missing from transaction dataset! Available columns: ['client_id', 'amount', 'transaction_date', 'status']"

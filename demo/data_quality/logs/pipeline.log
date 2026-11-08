@@ -1,0 +1,11 @@
+2026-10-07 09:15:10 [INFO] Initializing financial ledger pipeline
+2026-10-07 09:15:11 [STAGE: INGESTION] Loading transaction records from data/transactions.csv
+2026-10-07 09:15:11 [INFO] Loaded 6 records
+2026-10-07 09:15:11 [STAGE: AGGREGATION] Calculating totals and mean transaction values
+2026-10-07 09:15:11 [FATAL ERROR] Ledger pipeline failed: ValueError: Data quality check failed: Found 2 NULL values in critical financial field 'amount'. Ledger reconciliation cannot proceed without explicit handling policy.
+Traceback (most recent call last):
+  File "pipeline.py", line 37, in run_pipeline
+    summary = calculate_customer_aggregates(raw_df)
+  File "pipeline.py", line 18, in calculate_customer_aggregates
+    raise ValueError(
+ValueError: Data quality check failed: Found 2 NULL values in critical financial field 'amount'. Ledger reconciliation cannot proceed without explicit handling policy.

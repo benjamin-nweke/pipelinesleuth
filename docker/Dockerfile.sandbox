@@ -1,0 +1,19 @@
+# PipelineSleuth Sandboxed Execution Container
+FROM python:3.11-slim
+
+# Create non-root execution user for sandbox security
+RUN groupadd -g 1000 sleuthuser && \
+    useradd -u 1000 -g sleuthuser -m -s /bin/bash sleuthuser
+
+WORKDIR /workspace
+
+# Install common data engineering dependencies pre-baked in sandbox
+RUN pip install --no-cache-dir \
+    pandas \
+    pyarrow \
+    pytest \
+    numpy
+
+USER sleuthuser
+
+CMD ["python", "--version"]

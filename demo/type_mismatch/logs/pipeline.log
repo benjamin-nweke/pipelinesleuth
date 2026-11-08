@@ -1,0 +1,12 @@
+2026-10-07 10:00:05 [INFO] Initiating revenue aggregation pipeline run
+2026-10-07 10:00:05 [STAGE: INGEST] Loading transaction batch from data/transactions.csv
+2026-10-07 10:00:05 [STAGE: TYPE_CONVERSION] Casting transaction amounts to float64
+2026-10-07 10:00:05 [FATAL ERROR] Type conversion failed: ValueError: could not convert string to float: 'pending'
+Traceback (most recent call last):
+  File "pipeline.py", line 29, in run_pipeline
+    gross = parse_and_compute_revenue(raw_data)
+  File "pipeline.py", line 18, in parse_and_compute_revenue
+    amounts_numeric = df["amount"].astype(float)
+  File "pandas/core/generic.py", line 6643, in astype
+    new_data = self._mgr.astype(dtype=dtype, copy=copy, errors=errors)
+ValueError: could not convert string to float: 'pending'
