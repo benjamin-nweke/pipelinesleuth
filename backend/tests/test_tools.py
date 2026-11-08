@@ -94,6 +94,31 @@ async def test_analyze_logs(demo_drift_path):
 
 
 @pytest.mark.asyncio
+async def test_analyze_logs_credential_scrubbing():
+    tool = AnalyzeLogsTool()
+    raw_log = """
+2026-11-08 12:00:00 [WARNING] Connecting to db with password="superSecretPassword123"
+2026-11-08 12:00:01 [WARNING] Auth header: Bearer ya29.a0AfH6SMB_someLongSecretTokenHere12345
+2026-11-08 12:00:02 [WARNING] S3 failed with AKIAIOSFODNN7EXAMPLE
+Traceback (most recent call last):
+  File "pipeline.py", line 12, in connect
+    raise ConnectionError("Auth failed for api_key=sk_live_abcdef1234567890")
+ConnectionError: Auth failed for api_key=sk_live_abcdef1234567890
+"""
+    res = await tool.execute(".", {"raw_log_text": raw_log})
+    assert res.success is True
+    fatal = res.data["fatal_error"]
+    assert fatal is not None
+    assert "sk_live" not in fatal["exception_message"]
+    assert "[REDACTED_SECRET]" in fatal["exception_message"]
+    # Verify warnings / raw frame doesn't leak secrets
+    assert "superSecretPassword123" not in str(res.data)
+    assert "ya29" not in str(res.data)
+    assert "AKIAIOSFODNN7EXAMPLE" not in str(res.data)
+    assert "[REDACTED_AWS_KEY]" in str(res.data)
+
+
+@pytest.mark.asyncio
 async def test_inspect_code_ast(demo_drift_path):
     tool = InspectCodeTool()
     res = await tool.execute(demo_drift_path, {

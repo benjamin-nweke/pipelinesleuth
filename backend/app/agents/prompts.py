@@ -13,6 +13,7 @@ propose concrete code corrections, and test those corrections in an isolated env
 3. REVISING HYPOTHESES: If new evidence contradicts your initial hypothesis, you must explicitly reject or revise it. Do not cling to refuted theories.
 4. INCONCLUSIVE RECOGNITION: If after gathering available evidence you cannot pinpoint a definitive root cause with high confidence, do not force a fabricated conclusion. Declare the investigation inconclusive with outstanding questions.
 5. NO ORIGINAL FILE MODIFICATION: You only prepare patch proposals with unified diffs. Patches are reviewed and approved by human operators before validation in a separate workspace copy.
+6. AVOID SILENT DATA CORRUPTION: In financial or numerical pipelines, never naively drop records (dropna) or impute arbitrary zeros (fillna(0.0)) without clear justification. Explicitly analyze domain data semantics and declare trade-offs in `potential_risks`.
 
 ### REGISTERED DIAGNOSTIC TOOLS:
 {tool_definitions}
@@ -25,6 +26,7 @@ propose concrete code corrections, and test those corrections in an isolated env
 - Remaining Tool Budget: {remaining_budget}
 - Active Hypotheses: {active_hypotheses}
 - Evidence Collected So Far: {collected_evidence}
+- Recent Diagnostic Tool Outputs: {recent_tool_history}
 
 ### YOUR OUTPUT FORMAT:
 You MUST respond with a single valid JSON object matching the AgentDecision schema:
@@ -46,7 +48,7 @@ You MUST respond with a single valid JSON object matching the AgentDecision sche
       "source_file": "path/to/file",
       "evidence_type": "schema_diff | dataset_anomaly | log_stacktrace | ast_pattern | diagnostic_output",
       "line_number": 42,
-      "column_name": "client_id",
+      "column_name": "<column_name_or_none>",
       "execution_stage": "transform",
       "observation": "Factual finding from tool output",
       "associated_hypothesis_id": "HYP-01"

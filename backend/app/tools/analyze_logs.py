@@ -43,6 +43,21 @@ class AnalyzeLogsTool(BaseDiagnosticTool):
             timeout_seconds=self.timeout_seconds
         )
 
+    def _scrub_sensitive_data(self, text: str) -> str:
+        """Redacts sensitive tokens, API keys, passwords, and AWS credentials from logs."""
+        # Redact Bearer tokens
+        text = re.sub(r'(Bearer\s+)[A-Za-z0-9_\-\.]{15,}', r'\1[REDACTED_TOKEN]', text, flags=re.IGNORECASE)
+        # Redact AWS Access Key IDs
+        text = re.sub(r'\b(AKIA[0-9A-Z]{16})\b', r'[REDACTED_AWS_KEY]', text)
+        # Redact API keys, tokens, passwords in key=val or key: val patterns
+        text = re.sub(
+            r'((?:api[_-]?key|secret|password|passwd|token|auth)\s*[:=]\s*["\']?)[a-zA-Z0-9_\-\.]{8,}(["\']?)',
+            r'\1[REDACTED_SECRET]\2',
+            text,
+            flags=re.IGNORECASE
+        )
+        return text
+
     def _parse_content(self, text: str) -> Dict[str, Any]:
         lines = text.splitlines()
         
@@ -177,7 +192,8 @@ class AnalyzeLogsTool(BaseDiagnosticTool):
                 execution_time_ms=int((time.time() - start_time) * 1000)
             )
 
-        parsed = self._parse_content(content)
+        scrubbed_content = self._scrub_sensitive_data(content)
+        parsed = self._parse_content(scrubbed_content)
         fatal = parsed.get("fatal_error")
 
         if fatal:
