@@ -157,10 +157,12 @@ async def handle_patch_action(
             investigation_id=investigation_id,
             patch_id=patch_id,
             action=req.action,
-            reason=req.reason,
-            principal=principal
+            principal=principal,
+            reason=req.reason
         )
         return updated
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
     except ValueError as ve:
         err = str(ve).lower()
         if "not found" in err:

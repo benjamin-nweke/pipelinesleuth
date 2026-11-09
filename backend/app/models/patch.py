@@ -25,15 +25,17 @@ class PatchProposal(Base):
     supporting_evidence_ids = Column(JSON, default=list)
     expected_impact = Column(Text, nullable=True)
     potential_risks = Column(Text, nullable=True)
-    status = Column(String(50), default="proposed", nullable=False)  # proposed, approved, rejected, validated
+    status = Column(String(50), default="proposed", nullable=False)  # proposed, approved, validating, validated, validation_failed, rejected
     approved_by = Column(String(100), nullable=True)
     approved_at = Column(DateTime, nullable=True)
+    validation_claimed_at = Column(DateTime, nullable=True)
+    validation_claimed_by = Column(String(100), nullable=True)
     rejected_at = Column(DateTime, nullable=True)
     rejection_reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
-    investigation = relationship("Investigation", back_populates="patches")
-    validation_runs = relationship("ValidationRun", back_populates="patch", cascade="all, delete-orphan")
+    investigation = relationship("Investigation", back_populates="patches", lazy="selectin")
+    validation_runs = relationship("ValidationRun", back_populates="patch", cascade="all, delete-orphan", lazy="selectin")
 
 
 class ValidationRun(Base):
@@ -41,7 +43,7 @@ class ValidationRun(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: f"VAL-{uuid.uuid4().hex[:6].upper()}")
     investigation_id = Column(String(36), ForeignKey("investigations.id", ondelete="CASCADE"), nullable=False)
-    patch_id = Column(String(36), ForeignKey("patch_proposals.id", ondelete="CASCADE"), nullable=True)
+    patch_id = Column(String(36), ForeignKey("patch_proposals.id", ondelete="CASCADE"), nullable=False, unique=True)
     status = Column(String(50), default="passed", nullable=False)  # passed, failed, error, skipped
     exit_code = Column(Integer, default=0)
     stdout = Column(Text, default="")

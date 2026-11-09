@@ -48,6 +48,27 @@ async def init_db() -> None:
     import backend.app.models.report # noqa
     import backend.app.models.settings # noqa
 
+    def _sync_upgrade_schema(connection):
+        from sqlalchemy import text
+        # Ensure patch_proposals has concurrency tracking columns
+        res = connection.execute(text("PRAGMA table_info(patch_proposals)"))
+        columns = [row[1] for row in res.fetchall()]
+        if columns:
+            if "validation_claimed_at" not in columns:
+                connection.execute(text("ALTER TABLE patch_proposals ADD COLUMN validation_claimed_at DATETIME"))
+            if "validation_claimed_by" not in columns:
+                connection.execute(text("ALTER TABLE patch_proposals ADD COLUMN validation_claimed_by VARCHAR(255)"))
+
+        # Ensure validation_runs has unique index on patch_id
+        res = connection.execute(text("PRAGMA index_list(validation_runs)"))
+        indexes = [row[1] for row in res.fetchall()]
+        if "ix_validation_runs_patch_id_unique" not in indexes and "uq_validation_runs_patch_id" not in indexes:
+            try:
+                connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_validation_runs_patch_id ON validation_runs (patch_id)"))
+            except Exception:
+                pass
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_sync_upgrade_schema)
 

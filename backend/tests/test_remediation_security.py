@@ -29,7 +29,15 @@ from backend.app.schemas.agent import (
     AgentEvidenceInput, AgentDecision, InvestigationSummary,
     AgentHypothesisInput, ToolCallRequest
 )
+from backend.app.core.auth import AuthenticatedPrincipal
 from backend.app.sandbox.manager import sandbox_manager
+
+test_operator = AuthenticatedPrincipal(
+    principal_id="op_test_01",
+    username="alice@data-eng.com",
+    role="operator",
+    scopes=["patch:approve", "patch:reject"]
+)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -111,6 +119,7 @@ async def test_human_approval_rejected_patch_cannot_execute(db_session: AsyncSes
         investigation_id=inv.id,
         patch_id=patch.id,
         action="reject",
+        principal=test_operator,
         reason="Does not address edge case"
     )
     assert rejected.status == "rejected"
@@ -123,7 +132,8 @@ async def test_human_approval_rejected_patch_cannot_execute(db_session: AsyncSes
             db=db_session,
             investigation_id=inv.id,
             patch_id=patch.id,
-            action="approve"
+            action="approve",
+            principal=test_operator
         )
 
 
@@ -155,7 +165,7 @@ async def test_human_approval_approved_patch_records_metadata_and_authorizes(db_
         investigation_id=inv.id,
         patch_id=patch.id,
         action="approve",
-        authorized_by="alice@data-eng.com"
+        principal=test_operator
     )
     assert approved.status == "approved"
     assert approved.approved_by == "alice@data-eng.com"
@@ -209,7 +219,7 @@ async def test_repeated_approval_requests_blocked(db_session: AsyncSession):
         investigation_id=inv.id,
         patch_id=patch.id,
         action="approve",
-        authorized_by="bob"
+        principal=test_operator
     )
 
     # Second approval attempt must be blocked
@@ -219,7 +229,7 @@ async def test_repeated_approval_requests_blocked(db_session: AsyncSession):
             investigation_id=inv.id,
             patch_id=patch.id,
             action="approve",
-            authorized_by="bob"
+            principal=test_operator
         )
 
 

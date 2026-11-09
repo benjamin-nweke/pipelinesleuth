@@ -40,6 +40,8 @@ class PatchProposalRead(BaseModel):
     status: str
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
+    validation_claimed_at: Optional[datetime] = None
+    validation_claimed_by: Optional[str] = None
     rejected_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
     created_at: datetime

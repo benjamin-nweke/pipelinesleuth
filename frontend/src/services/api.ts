@@ -103,7 +103,10 @@ export async function fetchPatches(investigationId: string): Promise<PatchPropos
 }
 
 export function getOperatorAuthHeader(): Record<string, string> {
-  const token = localStorage.getItem('pipelinesleuth_operator_key') || 'ps_operator_sec_key_2026';
+  const token = localStorage.getItem('pipelinesleuth_operator_key');
+  if (!token) {
+    return {};
+  }
   return {
     'Authorization': `Bearer ${token}`
   };

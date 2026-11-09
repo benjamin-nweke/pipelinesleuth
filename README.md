@@ -77,7 +77,25 @@ npm run build --prefix frontend
 
 ### 2. Configure AI Model Provider
 
-#### Option A: Local Ollama (Recommended for offline developer workflows)
+### 2. Configure Environment and Security Credentials
+
+PipelineSleuth enforces zero hardcoded authentication credentials. Privileged patch review actions (approval and rejection) strictly require provisioned operator credentials.
+
+Create or update `.env` in the project root:
+
+```env
+# Operator Authorization Credentials (Required for Patch Approval/Rejection)
+OPERATOR_API_KEY=your_secure_operator_api_key_here
+
+# Optional: Multi-Operator Credential Configuration (JSON mapping)
+# OPERATOR_TOKENS_JSON='{"op_sec_admin": {"user_id": "operator_admin", "role": "operator", "scopes": ["patch:approve", "patch:reject"]}}'
+```
+
+If no operator credentials are configured, privileged endpoints refuse unauthenticated or unprovisioned requests with `401 Unauthorized`.
+
+#### AI Provider Configuration
+
+##### Option A: Local Ollama (Recommended for offline developer workflows)
 1. Install Ollama from [ollama.com](https://ollama.com).
 2. Pull the model:
    ```bash
@@ -88,7 +106,7 @@ npm run build --prefix frontend
    ollama serve
    ```
 
-#### Option B: OpenAI-Compatible Provider
+##### Option B: OpenAI-Compatible Provider
 Configure `.env` or navigate to `/settings` in the UI to set your API endpoint and key:
 ```env
 AI_PROVIDER=openai
@@ -136,7 +154,7 @@ PipelineSleuth includes three reproducible failure scenarios ready for one-click
 
 ## Running Automated Tests
 
-Run the full pytest suite (68 unit, security, persistence, API, and E2E integration tests):
+Run the full pytest suite (70 unit, security remediation, concurrency, persistence, API, and E2E integration tests):
 ```bash
 ./scripts/run_tests.sh
 ```

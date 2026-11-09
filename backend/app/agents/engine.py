@@ -27,6 +27,29 @@ from backend.app.agents.prompts import INVESTIGATION_SYSTEM_PROMPT
 from backend.app.schemas.agent import AgentEvidenceInput
 
 
+def resolve_frame_to_project_relative(frame_file: str, project_paths: set[str]) -> Optional[str]:
+    """
+    Safely converts a traceback frame file path (absolute, container, or relative)
+    to a known project-relative path.
+    Requires exact normalized path match or clean project-root strip.
+    Rejects arbitrary suffix matches.
+    """
+    if not frame_file:
+        return None
+    clean = os.path.normpath(frame_file).lstrip("/\\")
+    if clean in project_paths:
+        return clean
+
+    # For absolute or container paths (e.g. /app/src/pipeline.py or /tmp/proj-123/src/pipeline.py)
+    # Walk the path components from right to left to find a subpath that exactly matches a known project file
+    parts = Path(frame_file).parts
+    for i in range(len(parts)):
+        sub = os.path.normpath(str(Path(*parts[i:]))).lstrip("/\\")
+        if sub in project_paths:
+            return sub
+    return None
+
+
 def verify_evidence_against_telemetry(
     ev_input: AgentEvidenceInput,
     project_files: List[Any],
@@ -39,7 +62,7 @@ def verify_evidence_against_telemetry(
     Returns: (verification_status, is_inference, matched_tool_execution_id)
     - "inference": if explicitly marked as inference or speculative reasoning
     - "unverified": if source file does not exist, line numbers/columns are unsupported,
-                    or observation cannot be corroborated by tool outputs
+                    or observation cannot be corroborated by structured tool outputs
     - "verified": only if source file exists, and tool outputs directly corroborate
                   line numbers, column references, and observation facts.
     """
@@ -82,6 +105,8 @@ def verify_evidence_against_telemetry(
             if not investigation_id or te.investigation_id == investigation_id
         ]
 
+    obs_lower = ev_input.observation.lower()
+
     for te in candidate_execs:
         if not te or not te.output_result:
             continue
@@ -90,7 +115,7 @@ def verify_evidence_against_telemetry(
         tool_name = getattr(te, "tool_name", "")
         corroborated = False
 
-        # Corroborate by structured tool outputs
+        # 4. Corroborate strictly by structured tool outputs
         if tool_name == "analyze_logs" or "tracebacks" in out_data or "fatal_error" in out_data:
             # Check traceback frames
             frames: List[Dict[str, Any]] = []
@@ -107,91 +132,150 @@ def verify_evidence_against_telemetry(
                 exc_type = ""
                 exc_msg = ""
 
-            # Verify line number if specified
+            # Verify line number strictly on matching file (exact project-relative equality)
             line_matched = False
             for fr in frames:
-                fr_file = os.path.normpath(fr.get("file", "")).lstrip("/\\")
-                if fr_file == src_norm or fr_file.endswith(src_norm):
+                resolved_fr = resolve_frame_to_project_relative(fr.get("file", ""), project_paths)
+                if resolved_fr and resolved_fr == src_norm:
                     if ev_input.line_number is None or fr.get("line") == ev_input.line_number:
                         line_matched = True
                         break
 
-            if ev_input.line_number is not None and not line_matched:
+            if not line_matched:
                 # Line number not supported by traceback in this file
                 continue
 
-            # Check if exception/error fact is corroborated in observation
-            obs_lower = ev_input.observation.lower()
-            if line_matched:
-                if exc_type and exc_type.lower() in obs_lower:
-                    corroborated = True
-                elif exc_msg and any(w in obs_lower for w in exc_msg.lower().split() if len(w) > 3):
-                    corroborated = True
-                elif not exc_type and not exc_msg:
-                    corroborated = True
-                elif any(kw in obs_lower for kw in ("error", "exception", "failed", "crash", "traceback")):
-                    corroborated = True
+            # Traceback corroboration: MUST corroborate actual exception type or message keywords!
+            # Generic words like "error", "failed", "crash" are NOT sufficient.
+            has_exc_type = bool(exc_type and exc_type.lower() in obs_lower)
+            has_exc_msg = False
+            if exc_msg:
+                msg_keywords = [
+                    w.lower() for w in re.findall(r'[a-zA-Z0-9_]{3,}', exc_msg)
+                    if w.lower() not in {"error", "failed", "exception", "file", "line", "traceback", "crash", "terminat"}
+                ]
+                if any(kw in obs_lower for kw in msg_keywords):
+                    has_exc_msg = True
+
+            if has_exc_type or has_exc_msg:
+                corroborated = True
 
         elif tool_name == "inspect_schema" or "drift_columns" in out_data or "actual_schema" in out_data:
-            drift_cols = out_data.get("drift_columns", [])
-            missing_cols = out_data.get("missing_columns", [])
+            drift_cols = {c.lower() for c in out_data.get("drift_columns", [])}
+            missing_cols = {c.lower() for c in out_data.get("missing_columns", [])}
+            new_cols = {c.lower() for c in out_data.get("new_columns", [])}
             type_mismatches = out_data.get("type_mismatches", [])
-            new_cols = out_data.get("new_columns", [])
-            schema_cols = out_data.get("actual_schema") or out_data.get("schema") or {}
-            
-            all_cols = set(drift_cols + missing_cols + type_mismatches + new_cols)
-            if isinstance(schema_cols, dict):
-                all_cols.update(schema_cols.keys())
-            elif isinstance(schema_cols, list):
-                all_cols.update(schema_cols)
+            type_mismatch_cols = set()
+            for tm in type_mismatches:
+                if isinstance(tm, dict) and "column" in tm:
+                    type_mismatch_cols.add(tm["column"].lower())
+                elif isinstance(tm, str):
+                    type_mismatch_cols.add(tm.lower())
 
-            if ev_input.column_name:
-                if ev_input.column_name in all_cols:
-                    corroborated = True
+            schema_cols = out_data.get("actual_schema") or out_data.get("schema") or {}
+            all_cols = set(drift_cols | missing_cols | new_cols | type_mismatch_cols)
+            if isinstance(schema_cols, dict):
+                all_cols.update(k.lower() for k in schema_cols.keys())
+            elif isinstance(schema_cols, list):
+                all_cols.update(str(k).lower() for k in schema_cols)
+
+            col_lower = ev_input.column_name.lower() if ev_input.column_name else ""
+            if col_lower:
+                is_missing_claim = any(kw in obs_lower for kw in ("missing", "dropped", "removed", "not found", "lacking", "omitted"))
+                is_type_claim = any(kw in obs_lower for kw in ("type mismatch", "wrong type", "incompatible type", "expected type", "cast error"))
+                is_new_claim = any(kw in obs_lower for kw in ("added", "new column", "unexpected column", "renamed to", "extra column"))
+
+                if is_missing_claim:
+                    # Column must actually be in missing_columns or drift_columns
+                    if col_lower in missing_cols or col_lower in drift_cols:
+                        corroborated = True
+                elif is_type_claim:
+                    # Column must actually have a type mismatch
+                    if col_lower in type_mismatch_cols:
+                        corroborated = True
+                elif is_new_claim:
+                    # Column must be in new_columns or drift_columns
+                    if col_lower in new_cols or col_lower in drift_cols:
+                        corroborated = True
                 else:
-                    # Column not found in structured schema output
-                    continue
-            else:
-                # If no column specified, check if any drift was reported and observation reflects schema
-                if (drift_cols or missing_cols or type_mismatches) and any(kw in ev_input.observation.lower() for kw in ("schema", "drift", "missing", "column", "type")):
-                    corroborated = True
+                    # Factual observation about a present column
+                    if col_lower in all_cols:
+                        corroborated = True
 
         elif tool_name == "profile_dataset" or "anomalies" in out_data:
             anomalies = out_data.get("anomalies", [])
-            anomaly_cols = {a.get("column") for a in anomalies if isinstance(a, dict) and a.get("column")}
-            dataset_cols = set(out_data.get("columns", {}).keys()) if isinstance(out_data.get("columns"), dict) else set()
-            all_profile_cols = anomaly_cols.union(dataset_cols)
+            col_lower = ev_input.column_name.lower() if ev_input.column_name else ""
+            if col_lower:
+                matching_anomalies = [
+                    a for a in anomalies
+                    if isinstance(a, dict) and a.get("column", "").lower() == col_lower
+                ]
+                col_profile = out_data.get("columns", {}).get(ev_input.column_name, {}) if isinstance(out_data.get("columns"), dict) else {}
 
-            if ev_input.column_name:
-                if ev_input.column_name in all_profile_cols:
-                    corroborated = True
-                else:
-                    # Column not found in profile
-                    continue
-            else:
-                if anomalies and any(kw in ev_input.observation.lower() for kw in ("null", "anomaly", "quality", "outlier", "distribution")):
-                    corroborated = True
+                if matching_anomalies or col_profile:
+                    is_null_claim = any(kw in obs_lower for kw in ("null", "nan", "missing values"))
+                    has_null_anomaly = any(
+                        "null" in str(a.get("type", "")).lower() or a.get("null_count", 0) > 0
+                        for a in matching_anomalies
+                    ) or col_profile.get("null_count", 0) > 0
+
+                    if is_null_claim and not has_null_anomaly:
+                        corroborated = False
+                    else:
+                        # Check claimed statistics
+                        claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
+                        if claimed_numbers:
+                            telemetry_str = json.dumps(matching_anomalies) + " " + json.dumps(col_profile)
+                            # All claimed specific numbers must be present in telemetry
+                            all_numbers_found = all(
+                                num.rstrip('%') in telemetry_str for num in claimed_numbers
+                            )
+                            if all_numbers_found:
+                                corroborated = True
+                            else:
+                                corroborated = False  # Invented statistic!
+                        else:
+                            corroborated = True
 
         elif tool_name == "inspect_code" or "functions" in out_data:
             fns = out_data.get("functions", [])
             classes = out_data.get("classes", [])
+            fn_names = {f.get("name", "").lower() for f in fns if isinstance(f, dict) and f.get("name")}
+            class_names = {c.get("name", "").lower() for c in classes if isinstance(c, dict) and c.get("name")}
+
+            line_matched = False
             if ev_input.line_number is not None:
                 for fn in fns:
                     if fn.get("lineno") == ev_input.line_number or fn.get("end_lineno") == ev_input.line_number:
-                        corroborated = True
+                        line_matched = True
                         break
                 for cl in classes:
                     if cl.get("lineno") == ev_input.line_number:
-                        corroborated = True
+                        line_matched = True
                         break
-            else:
+
+            claimed_fn = any(fn in obs_lower for fn in fn_names if len(fn) > 2)
+            claimed_cls = any(cl in obs_lower for cl in class_names if len(cl) > 2)
+
+            if (claimed_fn or claimed_cls) and (ev_input.line_number is None or line_matched):
+                corroborated = True
+            elif ev_input.line_number is not None and line_matched and not fn_names and not class_names:
                 corroborated = True
 
-        elif tool_name == "test_hypothesis" or "test_passed" in out_data:
-            corroborated = True
+        elif tool_name == "test_hypothesis":
+            result_data = out_data.get("result", {}) if isinstance(out_data.get("result"), dict) else out_data
+            supported = result_data.get("supported") or out_data.get("supported")
+            if supported is True and any(kw in obs_lower for kw in ("support", "confirm", "pass", "valid")):
+                corroborated = True
+            elif supported is False and any(kw in obs_lower for kw in ("contradict", "reject", "fail", "refut")):
+                corroborated = True
 
         elif tool_name == "trace_dependencies":
-            corroborated = True
+            deps = {str(d).lower() for d in out_data.get("dependencies", [])}
+            imports = {str(imp).lower() for imp in out_data.get("imports", [])}
+            all_deps = deps | imports
+            if any(dep in obs_lower for dep in all_deps if len(dep) > 2):
+                corroborated = True
 
         if corroborated:
             return "verified", False, te.id

@@ -102,23 +102,30 @@ class InvestigationService:
         investigation_id: str,
         patch_id: str,
         action: str,  # "approve" or "reject"
-        reason: Optional[str] = None,
-        principal: Optional[AuthenticatedPrincipal] = None,
-        authorized_by: Optional[str] = None
+        principal: AuthenticatedPrincipal,
+        reason: Optional[str] = None
     ) -> PatchProposal:
         """
         Concurrency-safe, authenticated patch approval or rejection.
-        Uses atomic database updates to prevent race conditions and duplicate executions.
-        Derives approver identity exclusively from the authenticated server-side principal.
+        Requires an authenticated principal with explicit permission scopes:
+        - "patch:approve" for approval
+        - "patch:reject" for rejection
         """
-        # Determine verified approver identity
-        if principal:
-            approver_identity = principal.username
-        elif authorized_by:
-            approver_identity = authorized_by
-        else:
-            approver_identity = "authorized_operator"
+        # 1. Enforce mandatory principal
+        if not principal or not isinstance(principal, AuthenticatedPrincipal):
+            raise ValueError("Authentication error: An authenticated principal is strictly required to authorize patch actions.")
 
+        # 2. Enforce scope-based authorization (not just role name)
+        if action == "approve":
+            if "patch:approve" not in principal.scopes:
+                raise PermissionError(f"Forbidden: Principal '{principal.username}' lacks the required 'patch:approve' scope.")
+        elif action == "reject":
+            if "patch:reject" not in principal.scopes:
+                raise PermissionError(f"Forbidden: Principal '{principal.username}' lacks the required 'patch:reject' scope.")
+        else:
+            raise ValueError(f"Invalid patch action '{action}'. Allowed: 'approve', 'reject'.")
+
+        approver_identity = principal.username
         now = datetime.now(timezone.utc)
         target_status = "approved" if action == "approve" else "rejected"
 
