@@ -5,9 +5,10 @@ AI agents and ordinary diagnostic tools have no access to this execution path.
 Includes durable, cross-process database-backed validation claims and concurrency protection.
 """
 import time
+import uuid
 import logging
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.investigation import Investigation
@@ -73,14 +74,17 @@ class PrivilegedValidationService:
         db: AsyncSession,
         investigation_id: str,
         patch_id: str,
-        worker_id: str = "worker-01"
+        worker_id: str = "worker-01",
+        lease_seconds: int = 300
     ) -> PatchProposal:
         """
-        Durable, database-backed atomic claim step.
+        Durable, atomic database-backed claim acquisition with lease-token semantics.
         Ensures exactly ONE worker across all processes can claim a patch for validation.
-        Transitions patch from 'approved' -> 'validating'.
+        Transitions patch from 'approved' -> 'validating' with a unique claim token and lease expiry.
         """
         now = datetime.now(timezone.utc)
+        claim_token = f"claim_{uuid.uuid4().hex}"
+        lease_expires_at = now + timedelta(seconds=lease_seconds)
 
         # 1. Pre-check: verify patch existence and investigation scoping
         patch_res = await db.execute(
@@ -130,7 +134,7 @@ class PrivilegedValidationService:
                 f"Security violation: Patch '{patch_id}' has already been validated. Duplicate validation runs are forbidden."
             )
 
-        # 4. Atomic database state transition: 'approved' -> 'validating'
+        # 4. Atomic database state transition: 'approved' -> 'validating' with lease token
         claim_stmt = (
             update(PatchProposal)
             .where(
@@ -141,7 +145,9 @@ class PrivilegedValidationService:
             .values(
                 status="validating",
                 validation_claimed_at=now,
-                validation_claimed_by=worker_id
+                validation_lease_expires_at=lease_expires_at,
+                validation_claimed_by=worker_id,
+                validation_claim_token=claim_token
             )
         )
         claim_res = await db.execute(claim_stmt)
@@ -169,8 +175,57 @@ class PrivilegedValidationService:
             patch_id=patch_id,
             authorized_by=patch.approved_by,
             status="claimed",
-            details=f"Validation claim acquired by worker '{worker_id}'."
+            details=f"Validation claim acquired by worker '{worker_id}' with token '{claim_token[:12]}...' (lease expires: {lease_expires_at.isoformat()})."
         ))
+        return patch
+
+    async def renew_validation_lease(
+        self,
+        db: AsyncSession,
+        investigation_id: str,
+        patch_id: str,
+        claim_token: str,
+        extend_seconds: int = 300
+    ) -> PatchProposal:
+        """
+        Renews an active validation lease using compare-and-swap semantics.
+        A worker holding the valid claim_token can extend its lease to avoid expiration during long tests.
+        Workers lacking the matching claim_token are strictly rejected.
+        """
+        now = datetime.now(timezone.utc)
+        new_expires = now + timedelta(seconds=extend_seconds)
+
+        patch_res = await db.execute(
+            select(PatchProposal).where(
+                PatchProposal.id == patch_id,
+                PatchProposal.investigation_id == investigation_id
+            )
+        )
+        patch = patch_res.scalar_one_or_none()
+        if not patch:
+            raise ValueError(f"Patch '{patch_id}' not found.")
+
+        renew_stmt = (
+            update(PatchProposal)
+            .where(
+                PatchProposal.id == patch_id,
+                PatchProposal.investigation_id == investigation_id,
+                PatchProposal.status == "validating",
+                PatchProposal.validation_claim_token == claim_token
+            )
+            .values(
+                validation_lease_expires_at=new_expires
+            )
+        )
+        res = await db.execute(renew_stmt)
+        await db.commit()
+
+        if res.rowcount == 0:
+            raise ValueError(
+                f"Lease renewal rejected: Invalid claim token or patch '{patch_id}' is not in validating status under this lease."
+            )
+
+        await db.refresh(patch)
         return patch
 
     async def recover_abandoned_validation(
@@ -182,8 +237,10 @@ class PrivilegedValidationService:
         force: bool = False
     ) -> PatchProposal:
         """
-        Safely recovers an abandoned validation claim if the worker process died or timed out.
-        Atomically resets patch status back to 'approved' so it can be re-claimed.
+        Safely recovers an abandoned validation claim using compare-and-swap (CAS) semantics.
+        1. Verifies that the existing claim lease has genuinely expired.
+        2. Matches the exact claim token / claim timestamp in the atomic update predicate.
+        3. Refuses to reset if another worker has already reclaimed or modified the claim.
         """
         now = datetime.now(timezone.utc)
         patch_res = await db.execute(
@@ -198,35 +255,63 @@ class PrivilegedValidationService:
         if patch.status != "validating":
             raise ValueError(f"Patch '{patch_id}' is not in 'validating' state (current: '{patch.status}').")
 
-        if not force and patch.validation_claimed_at:
-            claimed_at = patch.validation_claimed_at
-            if claimed_at.tzinfo is None:
-                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
-            elapsed = (now - claimed_at).total_seconds()
-            if elapsed < timeout_seconds:
-                raise ValueError(f"Validation claim is still active ({elapsed:.1f}s elapsed < {timeout_seconds}s timeout).")
+        # Check lease expiry
+        if not force:
+            if patch.validation_lease_expires_at:
+                exp = patch.validation_lease_expires_at
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if now < exp:
+                    remaining = (exp - now).total_seconds()
+                    raise ValueError(f"Validation claim is still active ({remaining:.1f}s remaining on lease). Cannot recover active claim.")
+            elif patch.validation_claimed_at:
+                claimed_at = patch.validation_claimed_at
+                if claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+                elapsed = (now - claimed_at).total_seconds()
+                if elapsed < timeout_seconds:
+                    raise ValueError(f"Validation claim is still active ({elapsed:.1f}s elapsed < {timeout_seconds}s timeout).")
+
+        expected_token = patch.validation_claim_token
+        expected_claimed_at = patch.validation_claimed_at
+
+        # Atomic Compare-And-Swap (CAS) update
+        where_conditions = [
+            PatchProposal.id == patch_id,
+            PatchProposal.status == "validating"
+        ]
+        if expected_token:
+            where_conditions.append(PatchProposal.validation_claim_token == expected_token)
+        elif expected_claimed_at:
+            where_conditions.append(PatchProposal.validation_claimed_at == expected_claimed_at)
 
         reset_stmt = (
             update(PatchProposal)
-            .where(
-                PatchProposal.id == patch_id,
-                PatchProposal.status == "validating"
-            )
+            .where(*where_conditions)
             .values(
                 status="approved",
                 validation_claimed_at=None,
-                validation_claimed_by=None
+                validation_lease_expires_at=None,
+                validation_claimed_by=None,
+                validation_claim_token=None
             )
         )
-        await db.execute(reset_stmt)
+        res = await db.execute(reset_stmt)
         await db.commit()
+
+        if res.rowcount == 0:
+            raise ValueError(
+                f"Concurrency violation: Stale recovery attempt rejected. "
+                f"Patch '{patch_id}' claim was already reclaimed or updated by another worker."
+            )
+
         await db.refresh(patch)
         self._record_audit(PrivilegedValidationAuditEntry(
             investigation_id=investigation_id,
             patch_id=patch_id,
             authorized_by=patch.approved_by or "system",
             status="recovered",
-            details=f"Abandoned validation claim on patch '{patch_id}' recovered and reset to 'approved'."
+            details=f"Abandoned validation claim on patch '{patch_id}' recovered via CAS and reset to 'approved'."
         ))
         return patch
 

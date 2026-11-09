@@ -8,14 +8,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from backend.app.core.config import settings
-from backend.app.database.session import init_db
+from backend.app.core.auth import validate_all_operator_configuration
+from backend.app.database.session import init_db, check_supported_database_dialect
+from backend.app.services.investigation_service import investigation_service
 from backend.app.api.router import api_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize database tables on startup
+    # 1. Verify that database dialect is supported (SQLite-only)
+    check_supported_database_dialect(settings.DATABASE_URL)
+
+    # 2. Validate all configured operator authentication credentials
+    validate_all_operator_configuration()
+
+    # 3. Initialize database tables and migrations
     await init_db()
+
+    # 4. Resume any pending/abandoned validations stranded across process restarts
+    await investigation_service.resume_pending_validations_on_startup()
+
     yield
 
 

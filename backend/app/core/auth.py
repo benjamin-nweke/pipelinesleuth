@@ -6,13 +6,15 @@ Hardcoded credentials and predictable defaults are strictly prohibited.
 """
 import json
 import logging
-from typing import Optional, Dict
-from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field, model_validator
 from fastapi import Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
 from backend.app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+MIN_OPERATOR_TOKEN_LENGTH = 16
 
 # HTTP security schemes
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -33,10 +35,93 @@ PROHIBITED_TOKENS = frozenset({
 
 class AuthenticatedPrincipal(BaseModel):
     """Represents a verified, authenticated operator principal."""
-    principal_id: str = Field(..., description="Unique immutable ID of the authenticated user")
-    username: str = Field(..., description="Operator username or display identifier")
-    role: str = Field(..., description="Role of principal: 'operator', 'admin', 'viewer'")
+    principal_id: str = Field(..., description="Unique immutable canonical ID of the authenticated user")
+    username: str = Field(default="", description="Operator username or display identifier")
+    role: str = Field(default="operator", description="Role of principal: 'operator', 'admin', 'viewer'")
     scopes: list[str] = Field(default_factory=list, description="Granted permission scopes")
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_canonical_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Check for canonical principal_id
+            p_id = data.get("principal_id")
+            if not p_id or not str(p_id).strip():
+                raise ValueError("Principal definition must include a non-empty canonical 'principal_id'.")
+            clean_pid = str(p_id).strip()
+            data["principal_id"] = clean_pid
+            if not data.get("username"):
+                data["username"] = clean_pid
+        return data
+
+
+def validate_token_strength(token: str, token_name: str = "Operator token") -> str:
+    """
+    Validates that an operator credential token is non-empty, meets the minimum length,
+    exhibits sufficient entropy, and is not on the prohibited blocklist.
+    """
+    if not token or not isinstance(token, str):
+        raise ValueError(f"{token_name} must be a non-empty string.")
+    cleaned = token.strip()
+    if not cleaned:
+        raise ValueError(f"{token_name} cannot be blank or whitespace-only.")
+    if len(cleaned) < MIN_OPERATOR_TOKEN_LENGTH:
+        raise ValueError(
+            f"{token_name} is too short ({len(cleaned)} characters). "
+            f"Must be at least {MIN_OPERATOR_TOKEN_LENGTH} characters for adequate entropy."
+        )
+    if cleaned in PROHIBITED_TOKENS:
+        raise ValueError(f"Security error: {token_name} '{cleaned}' is on the prohibited credentials blocklist.")
+    if len(set(cleaned)) < 4:
+        raise ValueError(f"{token_name} lacks sufficient character diversity/entropy.")
+    return cleaned
+
+
+def validate_operator_tokens_json(raw_json: str) -> Dict[str, AuthenticatedPrincipal]:
+    """
+    Parses and strictly validates OPERATOR_TOKENS_JSON configuration.
+    Raises ValueError immediately on malformed JSON, invalid tokens, or missing fields.
+    """
+    if not raw_json or not raw_json.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Malformed OPERATOR_TOKENS_JSON: invalid JSON format ({e})") from e
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Malformed OPERATOR_TOKENS_JSON: top-level structure must be a JSON object mapping tokens to principals.")
+
+    validated: Dict[str, AuthenticatedPrincipal] = {}
+    for token_str, principal_dict in parsed.items():
+        clean_token = validate_token_strength(token_str, token_name="Token in OPERATOR_TOKENS_JSON")
+        if not isinstance(principal_dict, dict):
+            raise ValueError(f"Principal definition for token '{clean_token[:4]}...' must be a JSON object.")
+
+        # Require canonical principal_id
+        p_id = principal_dict.get("principal_id")
+        if not p_id or not isinstance(p_id, str) or not p_id.strip():
+            raise ValueError(f"Principal definition for token '{clean_token[:4]}...' is missing required non-blank 'principal_id'.")
+
+        try:
+            principal = AuthenticatedPrincipal(**principal_dict)
+        except Exception as e:
+            raise ValueError(f"Invalid principal definition for token '{clean_token[:4]}...': {e}") from e
+
+        validated[clean_token] = principal
+    return validated
+
+
+def validate_all_operator_configuration() -> None:
+    """
+    Validates all environment-provisioned operator credentials during application startup.
+    Fails startup with ValueError if any credential configuration is malformed, weak, or invalid.
+    """
+    if settings.OPERATOR_API_KEY:
+        validate_token_strength(settings.OPERATOR_API_KEY, token_name="OPERATOR_API_KEY")
+
+    if settings.OPERATOR_TOKENS_JSON:
+        validate_operator_tokens_json(settings.OPERATOR_TOKENS_JSON)
 
 
 # In-memory provisioned credential store (populated via env, startup provisioning, or test fixtures)
@@ -48,12 +133,8 @@ def register_operator_credential(token: str, principal: AuthenticatedPrincipal) 
     Explicitly provisions an operator credential in the store.
     Rejects empty, trivial, or prohibited tokens.
     """
-    token_clean = token.strip() if token else ""
-    if not token_clean:
-        raise ValueError("Cannot register empty operator credential token.")
-    if token_clean in PROHIBITED_TOKENS:
-        raise ValueError(f"Security error: Token '{token_clean}' is on the prohibited credentials blocklist.")
-    _DYNAMIC_OPERATOR_STORE[token_clean] = principal
+    clean_token = validate_token_strength(token, token_name="Operator credential token")
+    _DYNAMIC_OPERATOR_STORE[clean_token] = principal
 
 
 def clear_operator_credentials() -> None:
@@ -68,27 +149,26 @@ def get_all_provisioned_operators() -> Dict[str, AuthenticatedPrincipal]:
     """
     registry: Dict[str, AuthenticatedPrincipal] = {}
 
-    # 1. Load from environment OPERATOR_API_KEY if configured and not prohibited
+    # 1. Load from environment OPERATOR_API_KEY if configured and valid
     if settings.OPERATOR_API_KEY:
-        env_token = settings.OPERATOR_API_KEY.strip()
-        if env_token and env_token not in PROHIBITED_TOKENS:
+        try:
+            env_token = validate_token_strength(settings.OPERATOR_API_KEY, token_name="OPERATOR_API_KEY")
             registry[env_token] = AuthenticatedPrincipal(
                 principal_id="op_env_01",
                 username="env_configured_operator",
                 role="operator",
                 scopes=["patch:approve", "patch:reject", "investigation:run"]
             )
+        except ValueError as e:
+            logger.error(f"Invalid OPERATOR_API_KEY: {e}")
 
     # 2. Load from environment OPERATOR_TOKENS_JSON if configured
     if settings.OPERATOR_TOKENS_JSON:
         try:
-            tokens_dict = json.loads(settings.OPERATOR_TOKENS_JSON)
-            for t, p_data in tokens_dict.items():
-                t_clean = t.strip()
-                if t_clean and t_clean not in PROHIBITED_TOKENS and isinstance(p_data, dict):
-                    registry[t_clean] = AuthenticatedPrincipal(**p_data)
-        except Exception as e:
-            logger.error(f"Failed to parse OPERATOR_TOKENS_JSON: {e}")
+            parsed_tokens = validate_operator_tokens_json(settings.OPERATOR_TOKENS_JSON)
+            registry.update(parsed_tokens)
+        except ValueError as e:
+            logger.error(f"Invalid OPERATOR_TOKENS_JSON: {e}")
 
     # 3. Add dynamically registered credentials (e.g. from test fixtures or provisioning hooks)
     for t, p in _DYNAMIC_OPERATOR_STORE.items():

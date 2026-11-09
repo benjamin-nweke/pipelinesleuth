@@ -85,13 +85,16 @@ Create or update `.env` in the project root:
 
 ```env
 # Operator Authorization Credentials (Required for Patch Approval/Rejection)
-OPERATOR_API_KEY=your_secure_operator_api_key_here
+# Minimum 16 characters required for entropy
+OPERATOR_API_KEY=op_sec_token_dev_2026_admin
 
-# Optional: Multi-Operator Credential Configuration (JSON mapping)
-# OPERATOR_TOKENS_JSON='{"op_sec_admin": {"user_id": "operator_admin", "role": "operator", "scopes": ["patch:approve", "patch:reject"]}}'
+# Optional: Multi-Operator Credential Configuration (JSON mapping with canonical principal_id)
+# OPERATOR_TOKENS_JSON='{"op_sec_admin_token_2026_xyz": {"principal_id": "operator_admin", "role": "operator", "scopes": ["patch:approve", "patch:reject"]}}'
 ```
 
-If no operator credentials are configured, privileged endpoints refuse unauthenticated or unprovisioned requests with `401 Unauthorized`.
+- **Validation at Startup**: Operator credentials are strictly validated during application startup. Malformed JSON, tokens shorter than 16 characters, missing or blank canonical `principal_id`, and tokens on the prohibited blocklist cause immediate startup failure.
+- **Unprovisioned State**: If no operator credentials are configured, privileged endpoints refuse all unauthenticated requests with `401 Unauthorized`.
+- **Database Engine**: PipelineSleuth is currently built and supported **strictly on SQLite** (`sqlite+aiosqlite:///storage/pipelinesleuth.db`). The startup lifecycle inspects `DATABASE_URL` and fails early with a clear error if external dialects (such as PostgreSQL or MySQL) are configured.
 
 #### AI Provider Configuration
 
@@ -154,7 +157,7 @@ PipelineSleuth includes three reproducible failure scenarios ready for one-click
 
 ## Running Automated Tests
 
-Run the full pytest suite (70 unit, security remediation, concurrency, persistence, API, and E2E integration tests):
+Run the full pytest suite (96 unit, security remediation, CAS lease concurrency, OS-process contention, persistence, API, and E2E integration tests):
 ```bash
 ./scripts/run_tests.sh
 ```
@@ -165,12 +168,13 @@ PYTHONPATH=. .venv/bin/pytest backend/tests -v
 ```
 
 ### Security & Verification Test Suite Highlights
-PipelineSleuth includes an exhaustive security test suite covering:
+PipelineSleuth includes an exhaustive verification and security test suite covering:
 - **Part 1 — Authenticated Human Approval**: Server-enforced operator principals, rejection of unauthenticated/unauthorized actions, resistance to forged `authorized_by` parameters.
 - **Part 2 — Server-Controlled Tool Authorization**: Strict segregation of diagnostic tools from privileged patch validation; removal of caller-controlled role strings as a security boundary; patch precondition verification.
-- **Part 3 — Factual Evidence Verification**: Exact relative project paths (no directory basename collisions), corroboration against structured traceback frames and schema outputs, distinct inference classification.
-- **Part 4 — Investigation Transparency**: Clean enforcement of `InvestigationSummary` across backend, engine, and frontend; elimination of legacy internal thinking fields.
-- **Part 5 — Concurrency-Safe Operations**: Atomic SQLite state transitions preventing duplicate approval or validation races; resilient worker failure recovery.
+- **Part 3 — Strict Factual Evidence Verification**: Exact normalized project paths, rejection of traversal sequences and external symlinks, corroboration against structured traceback frames, schema outputs, dataset profile stats, AST syntactic definitions, and dependency directions.
+- **Part 4 — Concurrency-Safe Operations & CAS Leases**: Atomic SQLite compare-and-swap claims, unique database constraints on `validation_runs.patch_id`, lease duration tracking, heartbeat renewal, and safe recovery of expired claims preventing stale worker race conditions.
+- **Part 5 — Restart-Safe Validation Dispatch**: Persisted approval state and startup recovery finding approved or abandoned patches to resume background validation without duplicating runs.
+- **Part 6 — Genuine Multi-Process Concurrency**: Independent OS-process contention tests spawning concurrent Python subprocesses contending on the SQLite database.
 
 ---
 
@@ -186,14 +190,15 @@ The AI agent interacts with the codebase strictly through registered diagnostic 
 7. `run_diagnostic`: Controlled diagnostic executions inside the sandbox.
 8. `test_hypothesis`: Synthesizes evidence supporting vs. contradicting a theory.
 9. `propose_patch`: Generates syntactically validated candidate diffs without touching original files.
-10. `validate_patch`: Runs approved candidate fixes in an isolated scratch workspace.
+10. `validate_patch`: Runs approved candidate fixes in an isolated scratch workspace (privileged human-approved workflow).
 
 ---
 
 ## Known Limitations
 
-- **Docker Requirement for Code Execution**: Sandboxed execution and candidate patch validation require a local Docker daemon. When Docker is not installed or running, diagnostic tools like schema inspection, AST code parsing, log analysis, and patch generation function normally, while containerized runs are clearly flagged as unavailable. Unsafe direct host execution is deliberately prohibited.
-- **Single-Threaded SQLite Concurrency**: SQLite with `aiosqlite` is used for out-of-the-box local persistence without needing Postgres. For high-concurrency multi-tenant deployments, configure `DATABASE_URL` to PostgreSQL.
+- **SQLite-Only Deployment**: PipelineSleuth is currently built and verified exclusively for SQLite (`sqlite+aiosqlite:///storage/pipelinesleuth.db`). The startup lifecycle strictly validates database dialect and fails early if PostgreSQL or other dialects are specified. High-concurrency distributed deployments with external database engines are not supported in this release.
+- **Docker Requirement for Candidate Code Execution**: Sandboxed execution and candidate patch validation require a running local Docker daemon. When Docker is not installed or running, diagnostic tools (AST inspection, schema analysis, log parsing) operate normally, but containerized patch runs are safely flagged as unavailable. Unsafe direct host execution is strictly prohibited.
+- **Model Provider Dependency**: Autonomous root-cause hypothesis generation and code patch synthesis require an accessible LLM provider (local Ollama or OpenAI-compatible endpoint). When no model provider is available, diagnostic tools remain fully functional, while autonomous generation is paused.
 
 ---
 

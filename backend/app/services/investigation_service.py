@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.orm import selectinload
 
 from backend.app.database.session import AsyncSessionLocal
@@ -218,16 +218,79 @@ class InvestigationService:
             }
         })
 
-        # Concurrency guard for background validation dispatch
+        # Launch background validation with persisted dispatch
+        await self.dispatch_validation_background(investigation_id, patch.id)
+        return patch
+
+    async def dispatch_validation_background(self, investigation_id: str, patch_id: str) -> bool:
+        """
+        Dispatches background validation if not already actively validating in this process.
+        Returns True if a new background validation task was scheduled.
+        """
         async with self._validation_lock:
             if patch_id in self._active_validations:
                 logger.warning(f"Validation for patch '{patch_id}' is already active. Ignoring duplicate dispatch.")
-                return patch
+                return False
             self._active_validations.add(patch_id)
 
-        # Launch background validation using privileged validation service
-        asyncio.create_task(self._validate_patch_background(investigation_id, patch.id))
-        return patch
+        asyncio.create_task(self._validate_patch_background(investigation_id, patch_id))
+        return True
+
+    async def resume_pending_validations_on_startup(self) -> List[str]:
+        """
+        On application startup, detects approved patches whose validation was interrupted
+        by a process restart, crash, or deployment event, and safely resumes dispatch.
+        - Identifies 'approved' patches without existing validation runs.
+        - Identifies abandoned 'validating' patches with expired leases, recovers them to 'approved', and resumes.
+        - Ignores completed ('validated', 'validation_failed') or rejected patches.
+        - Ignores actively validating patches holding unexpired leases.
+        """
+        dispatched_ids: List[str] = []
+        try:
+            async with AsyncSessionLocal() as session:
+                # 1. Recover abandoned validating patches whose lease has expired
+                now = datetime.now(timezone.utc)
+                abandoned_query = select(PatchProposal).where(PatchProposal.status == "validating")
+                res = await session.execute(abandoned_query)
+                validating_patches = res.scalars().all()
+                for p in validating_patches:
+                    is_expired = False
+                    if p.validation_lease_expires_at:
+                        exp = p.validation_lease_expires_at.replace(tzinfo=timezone.utc) if p.validation_lease_expires_at.tzinfo is None else p.validation_lease_expires_at
+                        is_expired = now >= exp
+                    elif p.validation_claimed_at:
+                        c_at = p.validation_claimed_at.replace(tzinfo=timezone.utc) if p.validation_claimed_at.tzinfo is None else p.validation_claimed_at
+                        is_expired = (now - c_at).total_seconds() >= 300
+
+                    if is_expired:
+                        try:
+                            await privileged_validation_service.recover_abandoned_validation(
+                                db=session,
+                                investigation_id=p.investigation_id,
+                                patch_id=p.id,
+                                timeout_seconds=0,
+                                force=True
+                            )
+                            logger.info(f"Startup recovery: Reset abandoned validating patch '{p.id}' back to approved.")
+                        except Exception as e:
+                            logger.warning(f"Startup recovery could not reset validating patch '{p.id}': {e}")
+
+                # 2. Find eligible approved patches with no existing ValidationRun
+                approved_query = select(PatchProposal).where(PatchProposal.status == "approved")
+                res = await session.execute(approved_query)
+                approved_patches = res.scalars().all()
+                for p in approved_patches:
+                    val_count_res = await session.execute(
+                        select(func.count(ValidationRun.id)).where(ValidationRun.patch_id == p.id)
+                    )
+                    if (val_count_res.scalar_one() or 0) == 0:
+                        dispatched = await self.dispatch_validation_background(p.investigation_id, p.id)
+                        if dispatched:
+                            dispatched_ids.append(p.id)
+                            logger.info(f"Startup recovery: Resumed background validation for approved patch '{p.id}'.")
+        except Exception as e:
+            logger.error(f"Error during startup pending validation recovery: {e}", exc_info=True)
+        return dispatched_ids
 
     async def _validate_patch_background(self, investigation_id: str, patch_id: str) -> None:
         """

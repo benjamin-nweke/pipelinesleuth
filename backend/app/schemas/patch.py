@@ -41,7 +41,9 @@ class PatchProposalRead(BaseModel):
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
     validation_claimed_at: Optional[datetime] = None
+    validation_lease_expires_at: Optional[datetime] = None
     validation_claimed_by: Optional[str] = None
+    validation_claim_token: Optional[str] = None
     rejected_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
     created_at: datetime

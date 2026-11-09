@@ -27,46 +27,124 @@ from backend.app.agents.prompts import INVESTIGATION_SYSTEM_PROMPT
 from backend.app.schemas.agent import AgentEvidenceInput
 
 
-def resolve_frame_to_project_relative(frame_file: str, project_paths: set[str]) -> Optional[str]:
-    """
-    Safely converts a traceback frame file path (absolute, container, or relative)
-    to a known project-relative path.
-    Requires exact normalized path match or clean project-root strip.
-    Rejects arbitrary suffix matches.
-    """
-    if not frame_file:
-        return None
-    clean = os.path.normpath(frame_file).lstrip("/\\")
-    if clean in project_paths:
-        return clean
+RECOGNIZED_CONTAINER_ROOTS = (
+    "/app",
+    "/workspace",
+    "/candidate_workspace",
+    "/candidate",
+)
 
-    # For absolute or container paths (e.g. /app/src/pipeline.py or /tmp/proj-123/src/pipeline.py)
-    # Walk the path components from right to left to find a subpath that exactly matches a known project file
-    parts = Path(frame_file).parts
-    for i in range(len(parts)):
-        sub = os.path.normpath(str(Path(*parts[i:]))).lstrip("/\\")
-        if sub in project_paths:
-            return sub
-    return None
+
+def resolve_frame_to_project_relative(
+    frame_file: str,
+    project_paths: set[str],
+    workspace_dir: Optional[Path] = None
+) -> Optional[str]:
+    """
+    Strictly and safely resolves a traceback frame file path (project-relative, recognized container root,
+    or recognized workspace root) to an authorized project-relative path.
+    Enforces:
+    - Rejection of traversal attempts ('..')
+    - Rejection of arbitrary absolute paths not mapped to a known recognized root (no suffix matching!)
+    - Rejection of symlinks pointing outside the project workspace
+    - Verification that the target exists and is a regular file when workspace_dir is available
+    """
+    if not frame_file or not isinstance(frame_file, str):
+        return None
+
+    raw_path_str = frame_file.strip()
+    if not raw_path_str:
+        return None
+
+    # Reject traversal sequences immediately
+    if ".." in Path(raw_path_str).parts:
+        return None
+
+    is_absolute = os.path.isabs(raw_path_str)
+    candidate_rel: Optional[str] = None
+
+    if not is_absolute:
+        candidate_rel = os.path.normpath(raw_path_str).lstrip("/\\")
+    else:
+        # Check recognized container roots (e.g. /app/src/pipeline.py -> src/pipeline.py)
+        for c_root in RECOGNIZED_CONTAINER_ROOTS:
+            if raw_path_str == c_root or raw_path_str.startswith(c_root + "/"):
+                candidate_rel = os.path.relpath(raw_path_str, c_root).lstrip("/\\")
+                break
+
+        # Check recognized host roots
+        if candidate_rel is None and workspace_dir:
+            try:
+                ws_resolved = Path(workspace_dir).resolve()
+                frame_resolved = Path(raw_path_str).resolve()
+                if frame_resolved.is_relative_to(ws_resolved):
+                    candidate_rel = str(frame_resolved.relative_to(ws_resolved))
+            except Exception:
+                pass
+
+        if candidate_rel is None:
+            for host_root in [settings.WORKSPACES_DIR, settings.UPLOADS_DIR]:
+                try:
+                    hr_resolved = Path(host_root).resolve()
+                    frame_path = Path(raw_path_str).resolve()
+                    if frame_path.is_relative_to(hr_resolved):
+                        rel_to_hr = frame_path.relative_to(hr_resolved)
+                        if len(rel_to_hr.parts) > 1:
+                            sub = str(Path(*rel_to_hr.parts[1:]))
+                            if sub in project_paths:
+                                candidate_rel = sub
+                                break
+                except Exception:
+                    pass
+
+    # If candidate_rel is still None, arbitrary absolute path is REJECTED (no suffix matching!)
+    if not candidate_rel:
+        return None
+
+    # Traversal check on resulting candidate
+    if ".." in Path(candidate_rel).parts:
+        return None
+
+    candidate_norm = os.path.normpath(candidate_rel).lstrip("/\\")
+    if candidate_norm not in project_paths:
+        return None
+
+    # If workspace_dir is provided, verify on-disk resolution and symlink containment
+    if workspace_dir:
+        disk_path = Path(workspace_dir) / candidate_norm
+        try:
+            ws_resolved = Path(workspace_dir).resolve()
+            if not disk_path.exists():
+                return None
+            resolved_disk_path = disk_path.resolve()
+            # Symlinks must not escape the workspace
+            if not resolved_disk_path.is_relative_to(ws_resolved):
+                return None
+            if not resolved_disk_path.is_file():
+                return None
+        except Exception:
+            return None
+
+    return candidate_norm
 
 
 def verify_evidence_against_telemetry(
     ev_input: AgentEvidenceInput,
     project_files: List[Any],
     recent_tool_execs: List[ToolExecution],
-    investigation_id: Optional[str] = None
+    investigation_id: Optional[str] = None,
+    workspace_dir: Optional[Path] = None
 ) -> Tuple[str, bool, Optional[str]]:
     """
     Rigorously verifies model-submitted evidence against ground-truth project artifacts
     and empirical tool execution telemetry.
-    Returns: (verification_status, is_inference, matched_tool_execution_id)
-    - "inference": if explicitly marked as inference or speculative reasoning
-    - "unverified": if source file does not exist, line numbers/columns are unsupported,
-                    or observation cannot be corroborated by structured tool outputs
-    - "verified": only if source file exists, and tool outputs directly corroborate
-                  line numbers, column references, and observation facts.
+    Status rules:
+    - "verified": exact claim is supported by authoritative, structured evidence.
+    - "inference": evidence supports a plausible interpretation but does not establish exact claim.
+    - "unverified": available evidence does not establish the claim.
+    When uncertain, downgrades to "inference" or "unverified".
     """
-    # 1. Check if explicitly marked or typed as inference
+    # 1. Explicit inference or speculative hypothesis
     if ev_input.is_inference or "inference" in ev_input.evidence_type.lower() or "hypothesis" in ev_input.evidence_type.lower():
         return "inference", True, None
 
@@ -75,28 +153,37 @@ def verify_evidence_against_telemetry(
     if not src:
         return "unverified", False, None
 
-    src_norm = os.path.normpath(src).lstrip("/\\")
-    project_paths = {os.path.normpath(f.relative_path).lstrip("/\\") for f in project_files}
-    if src_norm not in project_paths:
-        # Non-existent, hallucinated, or ambiguous basename-only source file
+    # Traversal sequence in source_file is immediately unverified
+    if ".." in Path(src).parts:
         return "unverified", False, None
+
+    src_norm = os.path.normpath(src).lstrip("/\\")
+    project_paths = {os.path.normpath(f.relative_path).lstrip("/\\") for f in project_files if hasattr(f, "relative_path")}
+    if src_norm not in project_paths:
+        return "unverified", False, None
+
+    # Verify symlink and disk existence if workspace_dir is provided
+    if workspace_dir:
+        disk_path = Path(workspace_dir) / src_norm
+        try:
+            ws_res = Path(workspace_dir).resolve()
+            if not disk_path.exists() or not disk_path.resolve().is_relative_to(ws_res) or not disk_path.resolve().is_file():
+                return "unverified", False, None
+        except Exception:
+            return "unverified", False, None
 
     # 3. Match against tool execution telemetry
     matched_exec: Optional[ToolExecution] = None
-
     if ev_input.tool_execution_id:
         for te in recent_tool_execs:
             if te.id == ev_input.tool_execution_id:
-                # Check that execution belongs to the same investigation
                 if investigation_id and te.investigation_id != investigation_id:
                     return "unverified", False, None
                 matched_exec = te
                 break
         if not matched_exec:
-            # Fabricated or foreign tool execution ID
             return "unverified", False, None
 
-    # If no explicit ID, search recent tool executions for this investigation
     if matched_exec:
         candidate_execs = [matched_exec]
     else:
@@ -113,135 +200,187 @@ def verify_evidence_against_telemetry(
 
         out_data = te.output_result
         tool_name = getattr(te, "tool_name", "")
-        corroborated = False
 
         # 4. Corroborate strictly by structured tool outputs
+
+        # =====================================================================
+        # 1.2 EXCEPTION EVIDENCE & TRACEBACKS (analyze_logs)
+        # =====================================================================
         if tool_name == "analyze_logs" or "tracebacks" in out_data or "fatal_error" in out_data:
-            # Check traceback frames
             frames: List[Dict[str, Any]] = []
             if "tracebacks" in out_data and isinstance(out_data["tracebacks"], list):
                 for tb in out_data["tracebacks"]:
                     frames.extend(tb.get("frames", []))
+            
+            exc_types: List[str] = []
+            exc_messages: List[str] = []
             if "fatal_error" in out_data and out_data["fatal_error"]:
                 lf = out_data["fatal_error"].get("last_frame")
                 if lf:
                     frames.append(lf)
-                exc_type = out_data["fatal_error"].get("exception_type", "")
-                exc_msg = out_data["fatal_error"].get("message", "")
-            else:
-                exc_type = ""
-                exc_msg = ""
+                if out_data["fatal_error"].get("exception_type"):
+                    exc_types.append(out_data["fatal_error"]["exception_type"])
+                if out_data["fatal_error"].get("message"):
+                    exc_messages.append(out_data["fatal_error"]["message"])
+            if "tracebacks" in out_data and isinstance(out_data["tracebacks"], list):
+                for tb in out_data["tracebacks"]:
+                    if tb.get("exception_type"):
+                        exc_types.append(tb["exception_type"])
+                    if tb.get("message"):
+                        exc_messages.append(tb["message"])
 
-            # Verify line number strictly on matching file (exact project-relative equality)
+            # Verify line number strictly on matching file using strict path resolution
             line_matched = False
             for fr in frames:
-                resolved_fr = resolve_frame_to_project_relative(fr.get("file", ""), project_paths)
+                resolved_fr = resolve_frame_to_project_relative(fr.get("file", ""), project_paths, workspace_dir=workspace_dir)
                 if resolved_fr and resolved_fr == src_norm:
                     if ev_input.line_number is None or fr.get("line") == ev_input.line_number:
                         line_matched = True
                         break
 
             if not line_matched:
-                # Line number not supported by traceback in this file
                 continue
 
-            # Traceback corroboration: MUST corroborate actual exception type or message keywords!
-            # Generic words like "error", "failed", "crash" are NOT sufficient.
-            has_exc_type = bool(exc_type and exc_type.lower() in obs_lower)
-            has_exc_msg = False
-            if exc_msg:
-                msg_keywords = [
-                    w.lower() for w in re.findall(r'[a-zA-Z0-9_]{3,}', exc_msg)
-                    if w.lower() not in {"error", "failed", "exception", "file", "line", "traceback", "crash", "terminat"}
+            # Exception verification: generic words alone NEVER independently verify
+            generic_words = {"error", "missing", "failed", "invalid", "exception", "bug", "crash", "issue", "problem", "terminat"}
+            words_in_obs = set(re.findall(r'[a-zA-Z0-9_]{3,}', obs_lower))
+            non_generic_words = words_in_obs - generic_words
+
+            # 1. Check exception type corroboration
+            matched_exc_type = any(et.lower() in obs_lower for et in exc_types)
+            
+            # Check if observation asserts a conflicting exception type (e.g. claims ValueError when error is KeyError)
+            known_py_exceptions = {"keyerror", "valueerror", "typeerror", "filenotfounderror", "zerodivisionerror", "indexerror", "attributeerror", "importerror"}
+            mentioned_known_exceptions = words_in_obs & known_py_exceptions
+            if mentioned_known_exceptions:
+                actual_exc_types_lower = {et.lower() for et in exc_types}
+                if not (mentioned_known_exceptions & actual_exc_types_lower):
+                    # Conflicting exception type asserted!
+                    return "unverified", False, None
+
+            # 2. Check specific message corroboration (distinct tokens, column names, values)
+            matched_exc_msg = False
+            for msg in exc_messages:
+                msg_tokens = [
+                    w.lower() for w in re.findall(r'[a-zA-Z0-9_]{3,}', msg)
+                    if w.lower() not in generic_words
                 ]
-                if any(kw in obs_lower for kw in msg_keywords):
-                    has_exc_msg = True
+                if any(tok in obs_lower for tok in msg_tokens):
+                    matched_exc_msg = True
+                    break
 
-            if has_exc_type or has_exc_msg:
-                corroborated = True
+            # Both exception type OR specific error token must be present, plus non-generic content
+            if (matched_exc_type or matched_exc_msg) and non_generic_words:
+                return "verified", False, te.id
+            else:
+                # Uncorroborated by exception type or error tokens
+                return "unverified", False, None
 
-        elif tool_name == "inspect_schema" or "drift_columns" in out_data or "actual_schema" in out_data:
-            drift_cols = {c.lower() for c in out_data.get("drift_columns", [])}
-            missing_cols = {c.lower() for c in out_data.get("missing_columns", [])}
-            new_cols = {c.lower() for c in out_data.get("new_columns", [])}
-            type_mismatches = out_data.get("type_mismatches", [])
-            type_mismatch_cols = set()
-            for tm in type_mismatches:
-                if isinstance(tm, dict) and "column" in tm:
-                    type_mismatch_cols.add(tm["column"].lower())
-                elif isinstance(tm, str):
-                    type_mismatch_cols.add(tm.lower())
-
-            schema_cols = out_data.get("actual_schema") or out_data.get("schema") or {}
-            all_cols = set(drift_cols | missing_cols | new_cols | type_mismatch_cols)
-            if isinstance(schema_cols, dict):
-                all_cols.update(k.lower() for k in schema_cols.keys())
-            elif isinstance(schema_cols, list):
-                all_cols.update(str(k).lower() for k in schema_cols)
-
-            col_lower = ev_input.column_name.lower() if ev_input.column_name else ""
-            if col_lower:
-                is_missing_claim = any(kw in obs_lower for kw in ("missing", "dropped", "removed", "not found", "lacking", "omitted"))
-                is_type_claim = any(kw in obs_lower for kw in ("type mismatch", "wrong type", "incompatible type", "expected type", "cast error"))
-                is_new_claim = any(kw in obs_lower for kw in ("added", "new column", "unexpected column", "renamed to", "extra column"))
-
-                if is_missing_claim:
-                    # Column must actually be in missing_columns or drift_columns
-                    if col_lower in missing_cols or col_lower in drift_cols:
-                        corroborated = True
-                elif is_type_claim:
-                    # Column must actually have a type mismatch
-                    if col_lower in type_mismatch_cols:
-                        corroborated = True
-                elif is_new_claim:
-                    # Column must be in new_columns or drift_columns
-                    if col_lower in new_cols or col_lower in drift_cols:
-                        corroborated = True
-                else:
-                    # Factual observation about a present column
-                    if col_lower in all_cols:
-                        corroborated = True
-
+        # =====================================================================
+        # 1.3 DATASET PROFILING EVIDENCE (profile_dataset)
+        # =====================================================================
         elif tool_name == "profile_dataset" or "anomalies" in out_data:
             anomalies = out_data.get("anomalies", [])
-            col_lower = ev_input.column_name.lower() if ev_input.column_name else ""
-            if col_lower:
-                matching_anomalies = [
-                    a for a in anomalies
-                    if isinstance(a, dict) and a.get("column", "").lower() == col_lower
-                ]
-                col_profile = out_data.get("columns", {}).get(ev_input.column_name, {}) if isinstance(out_data.get("columns"), dict) else {}
+            columns_data = out_data.get("columns", {}) if isinstance(out_data.get("columns"), dict) else {}
+            dataset_stats = out_data.get("dataset", {}) if isinstance(out_data.get("dataset"), dict) else {}
+            col_name = ev_input.column_name or ""
+            col_lower = col_name.lower()
 
-                if matching_anomalies or col_profile:
-                    is_null_claim = any(kw in obs_lower for kw in ("null", "nan", "missing values"))
-                    has_null_anomaly = any(
-                        "null" in str(a.get("type", "")).lower() or a.get("null_count", 0) > 0
-                        for a in matching_anomalies
-                    ) or col_profile.get("null_count", 0) > 0
+            col_profile = columns_data.get(col_name, {}) if col_name else {}
+            matching_anomalies = [
+                a for a in anomalies
+                if isinstance(a, dict) and a.get("column", "").lower() == col_lower
+            ] if col_lower else []
 
-                    if is_null_claim and not has_null_anomaly:
-                        corroborated = False
-                    else:
-                        # Check claimed statistics
-                        claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
-                        if claimed_numbers:
-                            telemetry_str = json.dumps(matching_anomalies) + " " + json.dumps(col_profile)
-                            # All claimed specific numbers must be present in telemetry
-                            all_numbers_found = all(
-                                num.rstrip('%') in telemetry_str for num in claimed_numbers
-                            )
-                            if all_numbers_found:
-                                corroborated = True
-                            else:
-                                corroborated = False  # Invented statistic!
-                        else:
-                            corroborated = True
+            # Identify specific claim type
+            is_null_claim = any(kw in obs_lower for kw in ("null", "nan", "missing value", "empty value"))
+            is_dup_claim = any(kw in obs_lower for kw in ("duplicate", "repeated row", "repeated record"))
+            is_row_count_claim = any(kw in obs_lower for kw in ("row count", "total rows", "records loaded", "rows in dataset"))
+            is_type_claim = any(kw in obs_lower for kw in ("data type", "datatype", "type is", "dtype", "inferred type"))
 
+            claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
+
+            if is_null_claim and col_lower:
+                actual_null_count = col_profile.get("null_count", 0)
+                anomaly_null_count = sum(a.get("null_count", 0) for a in matching_anomalies if "null" in str(a.get("type", "")).lower())
+                recorded_nulls = max(actual_null_count, anomaly_null_count)
+
+                if recorded_nulls == 0:
+                    # Column has 0 nulls, claim that it has nulls is rejected!
+                    return "unverified", False, None
+
+                # If specific number claimed, must match recorded null count or null percentage
+                if claimed_numbers:
+                    recorded_nums = {
+                        str(recorded_nulls),
+                        f"{col_profile.get('null_percentage', -1):.1f}%",
+                        f"{col_profile.get('null_percentage', -1):.0f}%",
+                        str(col_profile.get('null_percentage', -1))
+                    }
+                    if not any(num in recorded_nums for num in claimed_numbers):
+                        return "unverified", False, None  # Invented statistic
+
+                return "verified", False, te.id
+
+            elif is_dup_claim:
+                recorded_dups = dataset_stats.get("duplicate_rows", 0)
+                if recorded_dups == 0:
+                    return "unverified", False, None
+                if claimed_numbers and not any(str(recorded_dups) == num for num in claimed_numbers):
+                    return "unverified", False, None
+                return "verified", False, te.id
+
+            elif is_row_count_claim:
+                recorded_rows = dataset_stats.get("total_rows", 0)
+                if claimed_numbers and not any(str(recorded_rows) == num for num in claimed_numbers):
+                    return "unverified", False, None
+                return "verified", False, te.id
+
+            elif is_type_claim and col_lower:
+                recorded_type = str(col_profile.get("dtype") or col_profile.get("inferred_type", "")).lower()
+                if recorded_type and recorded_type in obs_lower:
+                    return "verified", False, te.id
+                return "unverified", False, None
+
+            elif matching_anomalies:
+                # Anomaly claim for this column
+                telemetry_str = json.dumps(matching_anomalies) + " " + json.dumps(col_profile)
+                if claimed_numbers:
+                    if not all(num.rstrip('%') in telemetry_str for num in claimed_numbers):
+                        return "unverified", False, None
+                return "verified", False, te.id
+
+            else:
+                # Unrelated semantic claim not proven by dataset profile
+                return "inference", True, te.id
+
+        # =====================================================================
+        # 1.4 AST & CODE INSPECTION EVIDENCE (inspect_code)
+        # =====================================================================
         elif tool_name == "inspect_code" or "functions" in out_data:
             fns = out_data.get("functions", [])
             classes = out_data.get("classes", [])
-            fn_names = {f.get("name", "").lower() for f in fns if isinstance(f, dict) and f.get("name")}
-            class_names = {c.get("name", "").lower() for c in classes if isinstance(c, dict) and c.get("name")}
+            imports = out_data.get("imports", [])
+
+            fn_dict = {f.get("name", "").lower(): f for f in fns if isinstance(f, dict) and f.get("name")}
+            class_dict = {c.get("name", "").lower(): c for c in classes if isinstance(c, dict) and c.get("name")}
+            import_names = {str(imp).lower() for imp in imports}
+
+            # Runtime behavioral keywords that CANNOT be established by AST syntax alone
+            behavioral_keywords = {
+                "drop", "drops", "dropping",
+                "fail", "fails", "failing",
+                "crash", "crashes", "crashing",
+                "corrupt", "corrupts", "corrupting",
+                "bypass", "bypasses", "bypassing",
+                "leak", "leaks", "leaking",
+                "skip", "skips", "skipping",
+                "improper", "incorrectly", "erroneous"
+            }
+            is_behavioral_claim = any(bw in obs_lower for bw in behavioral_keywords)
+            if is_behavioral_claim:
+                # Do NOT infer runtime behavior from syntax alone!
+                return "inference", True, te.id
 
             line_matched = False
             if ev_input.line_number is not None:
@@ -254,31 +393,102 @@ def verify_evidence_against_telemetry(
                         line_matched = True
                         break
 
-            claimed_fn = any(fn in obs_lower for fn in fn_names if len(fn) > 2)
-            claimed_cls = any(cl in obs_lower for cl in class_names if len(cl) > 2)
+            # Syntactic facts: function existence, signature, class, or imports
+            claimed_fn = any(fn in obs_lower for fn in fn_dict.keys() if len(fn) > 2)
+            claimed_cls = any(cl in obs_lower for cl in class_dict.keys() if len(cl) > 2)
+            claimed_import = any(imp in obs_lower for imp in import_names if len(imp) > 2)
 
-            if (claimed_fn or claimed_cls) and (ev_input.line_number is None or line_matched):
-                corroborated = True
-            elif ev_input.line_number is not None and line_matched and not fn_names and not class_names:
-                corroborated = True
+            if (claimed_fn or claimed_cls or claimed_import) and (ev_input.line_number is None or line_matched):
+                return "verified", False, te.id
 
+        # =====================================================================
+        # 1.5 DEPENDENCY EVIDENCE (trace_dependencies)
+        # =====================================================================
+        elif tool_name == "trace_dependencies":
+            direct_deps = {str(d).lower() for d in out_data.get("dependencies", [])}
+            reverse_deps = {str(d).lower() for d in (out_data.get("reverse_dependencies") or out_data.get("dependents") or [])}
+            imports = {str(imp).lower() for imp in out_data.get("imports", [])}
+            packages = {str(pkg).lower() for pkg in out_data.get("packages", [])}
+
+            is_direct_claim = bool(
+                re.search(r'\bdepends\b(?:\s+\w+)?\s+on\b', obs_lower)
+                or any(kw in obs_lower for kw in ("requires", "upstream dependency", "direct dependency"))
+            )
+            is_reverse_claim = any(kw in obs_lower for kw in ("is used by", "depended on by", "downstream consumer", "reverse dependency"))
+            is_import_claim = any(kw in obs_lower for kw in ("imports", "imported from", "import statement"))
+            is_package_claim = any(kw in obs_lower for kw in ("declares package", "dependency package", "installed package", "package requirement"))
+
+            if is_direct_claim:
+                if any(dep in obs_lower for dep in direct_deps if len(dep) > 2):
+                    return "verified", False, te.id
+                elif any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
+                    # Reverse dependency mistakenly claimed as direct dependency!
+                    return "unverified", False, None
+
+            elif is_reverse_claim:
+                if any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
+                    return "verified", False, te.id
+
+            elif is_import_claim:
+                if any(imp in obs_lower for imp in imports if len(imp) > 2):
+                    return "verified", False, te.id
+
+            elif is_package_claim:
+                if any(pkg in obs_lower for pkg in packages if len(pkg) > 2):
+                    return "verified", False, te.id
+
+            else:
+                all_known = direct_deps | reverse_deps | imports | packages
+                if any(k in obs_lower for k in all_known if len(k) > 2):
+                    return "inference", True, te.id
+
+        # =====================================================================
+        # SCHEMA DRIFT (inspect_schema)
+        # =====================================================================
+        elif tool_name == "inspect_schema" or "drift_columns" in out_data or "actual_schema" in out_data:
+            drift_cols = {c.lower() for c in out_data.get("drift_columns", [])}
+            missing_cols = {c.lower() for c in out_data.get("missing_columns", [])}
+            new_cols = {c.lower() for c in out_data.get("new_columns", [])}
+            type_mismatches = out_data.get("type_mismatches", [])
+            type_mismatch_cols = set()
+            for tm in type_mismatches:
+                if isinstance(tm, dict) and "column" in tm:
+                    type_mismatch_cols.add(tm["column"].lower())
+                elif isinstance(tm, str):
+                    type_mismatch_cols.add(tm.lower())
+
+            col_lower = ev_input.column_name.lower() if ev_input.column_name else ""
+            if col_lower:
+                is_missing_claim = any(kw in obs_lower for kw in ("missing", "dropped", "removed", "not found", "lacking", "omitted"))
+                is_type_claim = any(kw in obs_lower for kw in ("type mismatch", "wrong type", "incompatible type", "expected type", "cast error"))
+                is_new_claim = any(kw in obs_lower for kw in ("added", "new column", "unexpected column", "renamed to", "extra column"))
+
+                if is_missing_claim:
+                    if col_lower in missing_cols or col_lower in drift_cols:
+                        return "verified", False, te.id
+                    else:
+                        return "unverified", False, None
+                elif is_type_claim:
+                    if col_lower in type_mismatch_cols:
+                        return "verified", False, te.id
+                    else:
+                        return "unverified", False, None
+                elif is_new_claim:
+                    if col_lower in new_cols or col_lower in drift_cols:
+                        return "verified", False, te.id
+                    else:
+                        return "unverified", False, None
+
+        # =====================================================================
+        # HYPOTHESIS TESTING (test_hypothesis)
+        # =====================================================================
         elif tool_name == "test_hypothesis":
             result_data = out_data.get("result", {}) if isinstance(out_data.get("result"), dict) else out_data
             supported = result_data.get("supported") or out_data.get("supported")
             if supported is True and any(kw in obs_lower for kw in ("support", "confirm", "pass", "valid")):
-                corroborated = True
+                return "verified", False, te.id
             elif supported is False and any(kw in obs_lower for kw in ("contradict", "reject", "fail", "refut")):
-                corroborated = True
-
-        elif tool_name == "trace_dependencies":
-            deps = {str(d).lower() for d in out_data.get("dependencies", [])}
-            imports = {str(imp).lower() for imp in out_data.get("imports", [])}
-            all_deps = deps | imports
-            if any(dep in obs_lower for dep in all_deps if len(dep) > 2):
-                corroborated = True
-
-        if corroborated:
-            return "verified", False, te.id
+                return "verified", False, te.id
 
     return "unverified", False, None
 
@@ -539,7 +749,8 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
                     ev_input=ev_input,
                     project_files=project_files,
                     recent_tool_execs=recent_tool_execs,
-                    investigation_id=self.investigation_id
+                    investigation_id=self.investigation_id,
+                    workspace_dir=Path(project_storage_dir) if os.path.exists(project_storage_dir) else None
                 )
                 ev_rec = EvidenceRecord(
                     investigation_id=self.investigation_id,
