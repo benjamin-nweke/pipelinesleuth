@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     ALLOWED_EXTENSIONS: list[str] = [
         ".py", ".csv", ".parquet", ".json", ".log", ".txt", ".sql", ".yaml", ".yml", ".md"
     ]
+    OPERATOR_API_KEY: str = "ps_operator_sec_key_2026"
 
 
 

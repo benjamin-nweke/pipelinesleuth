@@ -14,7 +14,7 @@ from backend.app.models.investigation import Investigation, EvidenceRecord, Hypo
 from backend.app.models.patch import PatchProposal, ValidationRun
 from backend.app.agents.engine import InvestigationEngine
 from backend.app.agents.provider import AIProvider, ModelProviderError
-from backend.app.schemas.agent import AgentDecision, ToolCallRequest, AgentEvidenceInput, AgentHypothesisInput, AgentPatchInput, AgentReportInput
+from backend.app.schemas.agent import AgentDecision, ToolCallRequest, AgentEvidenceInput, AgentHypothesisInput, AgentPatchInput, AgentReportInput, InvestigationSummary
 from backend.app.sandbox.manager import sandbox_manager
 from backend.app.services.project_service import ProjectService
 from backend.app.services.investigation_service import investigation_service
@@ -37,7 +37,14 @@ class MockAIProvider(AIProvider):
             return decision
         # Fallback conclusion
         return AgentDecision(
-            thinking="Investigation budget reached.",
+            investigation_summary=InvestigationSummary(
+                investigation_focus="Investigation budget reached.",
+                tool_selection_reason=None,
+                finding_summary="Budget reached, producing report.",
+                hypothesis_impact=None,
+                next_steps=None,
+                conclusion_rationale="Concluded after reaching limit"
+            ),
             current_stage="report_generation",
             action_type="conclude_inconclusive",
             final_report=AgentReportInput(
@@ -121,7 +128,14 @@ async def test_investigation_loop_with_hypothesis_revision_and_patch(test_sessio
     # Multi-step deterministic decision sequence:
     # Step 1: inspect log -> finds KeyError: customer_id. Formulates initial hypothesis HYP-1 (Data corruption)
     decision1 = AgentDecision(
-        thinking="First, analyze logs to localize the exact exception and line number.",
+        investigation_summary=InvestigationSummary(
+            investigation_focus="First, analyze logs to localize the exact exception and line number.",
+            tool_selection_reason="Check pipeline log for stacktrace",
+            finding_summary=None,
+            hypothesis_impact=None,
+            next_steps="Call analyze_logs",
+            conclusion_rationale=None
+        ),
         current_stage="failure_localization",
         hypotheses=[
             AgentHypothesisInput(
@@ -143,7 +157,14 @@ async def test_investigation_loop_with_hypothesis_revision_and_patch(test_sessio
 
     # Step 2: Log showed customer_id KeyError. Now inspect schema. Rejects initial hypothesis, formulates HYP-2 (Schema drift)
     decision2 = AgentDecision(
-        thinking="The log shows KeyError: 'customer_id' at line 18 in transform_and_aggregate. Inspect schema to check columns.",
+        investigation_summary=InvestigationSummary(
+            investigation_focus="The log shows KeyError: 'customer_id' at line 18 in transform_and_aggregate. Inspect schema to check columns.",
+            tool_selection_reason="Inspect schema of data/transactions.csv to check for drift",
+            finding_summary="KeyError: customer_id at line 18",
+            hypothesis_impact="Rejects HYP-1, indicates schema drift",
+            next_steps="Call inspect_schema",
+            conclusion_rationale=None
+        ),
         current_stage="evidence_collection",
         hypotheses=[
             AgentHypothesisInput(
@@ -181,7 +202,14 @@ async def test_investigation_loop_with_hypothesis_revision_and_patch(test_sessio
 
     # Step 3: Schema drift confirmed. Propose code patch.
     decision3 = AgentDecision(
-        thinking="Schema diff proves client_id replaced customer_id. Formulating code correction in pipeline.py.",
+        investigation_summary=InvestigationSummary(
+            investigation_focus="Schema diff proves client_id replaced customer_id. Formulating code correction in pipeline.py.",
+            tool_selection_reason=None,
+            finding_summary="Schema diff confirms client_id replaces customer_id",
+            hypothesis_impact="Confirms HYP-2",
+            next_steps="Prepare patch proposal",
+            conclusion_rationale="Root cause identified as schema drift"
+        ),
         current_stage="patch_generation",
         hypotheses=[
             AgentHypothesisInput(

@@ -30,7 +30,9 @@ frontend/dist/
 frontend/.vite/
 
 # Application storage & database
-storage/pipelinesleuth.db
+storage/*.db*
+*.db-shm
+*.db-wal
 storage/uploads/*
 !storage/uploads/.gitkeep
 storage/workspaces/*

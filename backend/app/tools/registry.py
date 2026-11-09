@@ -36,7 +36,6 @@ class DiagnosticToolRegistry:
             RunDiagnosticTool(),
             TestHypothesisTool(),
             ProposePatchTool(),
-            ValidatePatchTool(),
         ]
         for tool in tools:
             self.register_tool(tool)
@@ -123,9 +122,26 @@ class DiagnosticToolRegistry:
         execution budget guards, per-tool timeouts, and tamper-resistant audit logging.
         """
         start_time = time.time()
+
+        # 1. Privileged tool gate: validate_patch is excluded from diagnostic registry
+        if tool_name == "validate_patch":
+            err_msg = (
+                f"Permission denied: Tool 'validate_patch' requires explicit human approval and cannot be invoked "
+                f"by caller role '{caller_role}'. Direct AI invocation of patch validation is strictly blocked. "
+                "Patch validation is a privileged server-side workflow and cannot be invoked through the diagnostic tool registry."
+            )
+            result = ToolResult(
+                success=False,
+                summary="Security violation: Direct invocation of patch validation by AI is blocked.",
+                error=err_msg,
+                execution_time_ms=0
+            )
+            self._log_audit(investigation_id, tool_name, arguments, result, caller_role)
+            return result
+
         tool = self.get_tool(tool_name)
 
-        # 1. Unknown tool check
+        # 2. Unknown tool check
         if not tool:
             err_msg = f"Unregistered diagnostic tool '{tool_name}'. Available: {self.list_tool_names()}"
             result = ToolResult(
@@ -161,14 +177,14 @@ class DiagnosticToolRegistry:
             self._log_audit(investigation_id, tool_name, arguments, result, caller_role)
             return result
 
-        if tool.permission_level == "human_approval_required" and caller_role != "human_approved_workflow":
+        if tool.permission_level == "human_approval_required":
             err_msg = (
-                f"Permission denied: Tool '{tool_name}' requires explicit human approval and cannot be invoked "
-                f"by caller role '{caller_role}'. Direct AI invocation of patch validation is strictly blocked."
+                f"Permission denied: Privileged tool '{tool_name}' requires authenticated human approval "
+                f"and cannot be invoked through the diagnostic tool registry regardless of caller-supplied roles."
             )
             result = ToolResult(
                 success=False,
-                summary="Security violation: Direct invocation of patch validation by AI is blocked.",
+                summary="Security violation: Privileged tools cannot be invoked through diagnostic registry.",
                 error=err_msg,
                 execution_time_ms=0
             )

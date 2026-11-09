@@ -621,17 +621,17 @@ def test_agent_decision_investigation_summary_enforced():
 
     assert decision.investigation_summary.investigation_focus == "Investigating KeyError in customer transaction aggregation"
     assert decision.investigation_summary.tool_selection_reason == "Inspect schema of data/transactions.csv to identify missing column"
-    assert decision.thinking == "Investigating KeyError in customer transaction aggregation"
+    assert "thinking" not in AgentDecision.model_fields
 
 
-def test_agent_decision_legacy_thinking_conversion():
-    """Legacy payloads with thinking are seamlessly reconciled into investigation_summary."""
-    decision = AgentDecision(
-        thinking="Legacy thinking text from older mock test",
-        current_stage="context_collection",
-        action_type="conclude_inconclusive",
-        confidence_score=0.2
-    )
-
-    assert decision.investigation_summary.investigation_focus == "Legacy thinking text from older mock test"
-    assert decision.thinking == "Legacy thinking text from older mock test"
+def test_agent_decision_legacy_thinking_rejected():
+    """Legacy payloads with thinking only are rejected; investigation_summary is strictly required."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc_info:
+        AgentDecision(
+            thinking="Legacy thinking text from older mock test",
+            current_stage="context_collection",
+            action_type="conclude_inconclusive",
+            confidence_score=0.2
+        )
+    assert "investigation_summary" in str(exc_info.value)

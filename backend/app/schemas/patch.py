@@ -49,4 +49,7 @@ class PatchProposalRead(BaseModel):
 class PatchActionRequest(BaseModel):
     action: str = Field(..., pattern="^(approve|reject)$")
     reason: Optional[str] = None
-    authorized_by: Optional[str] = "human_operator"
+    authorized_by: Optional[str] = Field(
+        None,
+        description="Deprecated & untrusted. Approver identity is derived exclusively from server-side authenticated principal."
+    )

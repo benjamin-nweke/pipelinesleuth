@@ -21,6 +21,7 @@ from backend.app.schemas.investigation import (
     InvestigationEventRead, EvidenceRecordRead, HypothesisRead, ToolExecutionRead
 )
 from backend.app.schemas.patch import PatchProposalRead, PatchActionRequest, ValidationRunRead
+from backend.app.core.auth import AuthenticatedPrincipal, require_operator_principal
 from backend.app.schemas.report import InvestigationReportRead
 from backend.app.services.investigation_service import investigation_service
 
@@ -147,6 +148,7 @@ async def handle_patch_action(
     investigation_id: str,
     patch_id: str,
     req: PatchActionRequest,
+    principal: AuthenticatedPrincipal = Depends(require_operator_principal),
     db: AsyncSession = Depends(get_db)
 ):
     try:
@@ -156,11 +158,19 @@ async def handle_patch_action(
             patch_id=patch_id,
             action=req.action,
             reason=req.reason,
-            authorized_by=req.authorized_by
+            principal=principal
         )
         return updated
     except ValueError as ve:
-        status_code = 404 if "not found" in str(ve).lower() else 400
+        err = str(ve).lower()
+        if "not found" in err:
+            status_code = 404
+        elif "already" in err or "cannot be transitioned" in err or "conflict" in err:
+            status_code = 409
+        elif "security violation" in err or "unauthorized" in err or "forbidden" in err:
+            status_code = 403
+        else:
+            status_code = 400
         raise HTTPException(status_code=status_code, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

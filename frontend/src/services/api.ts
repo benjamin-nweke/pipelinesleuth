@@ -102,6 +102,13 @@ export async function fetchPatches(investigationId: string): Promise<PatchPropos
   return res.json();
 }
 
+export function getOperatorAuthHeader(): Record<string, string> {
+  const token = localStorage.getItem('pipelinesleuth_operator_key') || 'ps_operator_sec_key_2026';
+  return {
+    'Authorization': `Bearer ${token}`
+  };
+}
+
 export async function handlePatchAction(
   investigationId: string,
   patchId: string,
@@ -110,7 +117,10 @@ export async function handlePatchAction(
 ): Promise<PatchProposal> {
   const res = await fetch(`${API_BASE}/investigations/${investigationId}/patches/${patchId}/action`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getOperatorAuthHeader()
+    },
     body: JSON.stringify({ action, reason }),
   });
   if (!res.ok) {

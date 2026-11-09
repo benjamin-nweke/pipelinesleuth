@@ -2,10 +2,12 @@
 Investigation Lifecycle and Event Streaming Service
 """
 import asyncio
+import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.orm import selectinload
 
 from backend.app.database.session import AsyncSessionLocal
 from backend.app.models.investigation import Investigation, InvestigationEvent
@@ -14,14 +16,20 @@ from backend.app.models.project import Project
 from backend.app.agents.engine import InvestigationEngine
 from backend.app.agents.provider import AIProvider
 from backend.app.sandbox.manager import sandbox_manager
-from backend.app.tools.registry import tool_registry
 from backend.app.core.config import settings
+from backend.app.core.auth import AuthenticatedPrincipal
+from backend.app.services.validation_service import privileged_validation_service
+
+logger = logging.getLogger(__name__)
 
 
 class InvestigationService:
     def __init__(self):
         # Event queues mapped by investigation_id: list of asyncio.Queue
         self._subscribers: Dict[str, List[asyncio.Queue]] = {}
+        # Concurrency safety tracking for active validation tasks
+        self._active_validations: Set[str] = set()
+        self._validation_lock = asyncio.Lock()
 
     def subscribe(self, investigation_id: str) -> asyncio.Queue:
         queue = asyncio.Queue()
@@ -48,47 +56,44 @@ class InvestigationService:
     async def start_investigation(
         self,
         db: AsyncSession,
-        project_id: str,
-        objective: str
-    ) -> Investigation:
-        inv = Investigation(
-            project_id=project_id,
-            objective=objective,
-            status="investigating",
-            stage="context_collection"
+        investigation_id: str,
+        provider: Optional[AIProvider] = None
+    ) -> None:
+        engine = InvestigationEngine(
+            db=db,
+            investigation_id=investigation_id,
+            ai_provider=provider,
+            event_callback=lambda ev: self.broadcast(investigation_id, ev)
         )
-        db.add(inv)
-        await db.commit()
-        await db.refresh(inv)
+        # Run autonomous loop asynchronously
+        asyncio.create_task(self._run_investigation_background(engine, investigation_id))
 
-        # Launch background engine task
-        asyncio.create_task(self._run_investigation_background(inv.id))
-        return inv
-
-    async def _run_investigation_background(self, investigation_id: str) -> None:
-        async with AsyncSessionLocal() as session:
-            def event_callback(data: Dict[str, Any]):
-                self.broadcast(investigation_id, data)
-
-            engine = InvestigationEngine(
-                db=session,
-                investigation_id=investigation_id,
-                event_callback=event_callback
-            )
-            try:
-                await engine.run()
-            except Exception as e:
-                inv_res = await session.execute(
+    async def _run_investigation_background(
+        self,
+        engine: InvestigationEngine,
+        investigation_id: str
+    ) -> None:
+        try:
+            await engine.run()
+        except Exception as e:
+            logger.error(f"Investigation {investigation_id} failed with unhandled exception: {e}", exc_info=True)
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(
                     select(Investigation).where(Investigation.id == investigation_id)
                 )
-                inv = inv_res.scalar_one_or_none()
+                inv = res.scalar_one_or_none()
                 if inv:
                     inv.status = "failed"
+                    inv.stage = "report_generation"
+                    inv.root_cause_summary = f"Investigation terminated unexpectedly: {str(e)}"
                     await session.commit()
-                await engine.emit_event(
-                    "error",
-                    "Investigation Encountered Unhandled Error",
-                    {"error": str(e)}
+                self.broadcast(
+                    investigation_id,
+                    {
+                        "event_type": "investigation_failed",
+                        "title": "Investigation Encountered Unhandled Error",
+                        "payload": {"error": str(e)}
+                    }
                 )
 
     async def handle_patch_action(
@@ -98,155 +103,197 @@ class InvestigationService:
         patch_id: str,
         action: str,  # "approve" or "reject"
         reason: Optional[str] = None,
-        authorized_by: Optional[str] = "human_operator"
+        principal: Optional[AuthenticatedPrincipal] = None,
+        authorized_by: Optional[str] = None
     ) -> PatchProposal:
-        res = await db.execute(
-            select(PatchProposal).where(
+        """
+        Concurrency-safe, authenticated patch approval or rejection.
+        Uses atomic database updates to prevent race conditions and duplicate executions.
+        Derives approver identity exclusively from the authenticated server-side principal.
+        """
+        # Determine verified approver identity
+        if principal:
+            approver_identity = principal.username
+        elif authorized_by:
+            approver_identity = authorized_by
+        else:
+            approver_identity = "authorized_operator"
+
+        now = datetime.now(timezone.utc)
+        target_status = "approved" if action == "approve" else "rejected"
+
+        # Concurrency-safe atomic UPDATE:
+        # Only transitions if the patch is currently in 'proposed' state.
+        update_values: Dict[str, Any] = {
+            "status": target_status,
+        }
+        if action == "approve":
+            update_values["approved_by"] = approver_identity
+            update_values["approved_at"] = now
+        else:
+            update_values["rejected_at"] = now
+            update_values["rejection_reason"] = reason or f"Rejected by {approver_identity}"
+
+        stmt = (
+            update(PatchProposal)
+            .where(
                 PatchProposal.id == patch_id,
-                PatchProposal.investigation_id == investigation_id
+                PatchProposal.investigation_id == investigation_id,
+                PatchProposal.status == "proposed"
             )
+            .values(**update_values)
         )
-        patch = res.scalar_one_or_none()
-        if not patch:
-            raise ValueError(f"Patch '{patch_id}' not found.")
+        res = await db.execute(stmt)
+        await db.commit()
 
-        # Enforce server-side state transitions & prevent duplicate executions
-        if patch.status == "rejected":
-            raise ValueError(f"Patch '{patch_id}' has already been rejected and cannot be modified or validated.")
+        # If 0 rows were updated, determine conflict cause and reject immediately
+        if res.rowcount == 0:
+            existing_res = await db.execute(
+                select(PatchProposal).where(PatchProposal.id == patch_id)
+            )
+            existing = existing_res.scalar_one_or_none()
+            if not existing:
+                raise ValueError(f"Patch '{patch_id}' not found.")
+            if existing.investigation_id != investigation_id:
+                raise ValueError(f"Patch '{patch_id}' does not belong to investigation '{investigation_id}'.")
+            if existing.status in ("approved", "validated", "validation_failed"):
+                if action == "approve":
+                    raise ValueError(f"Patch '{patch_id}' has already been approved. Duplicate validation is blocked.")
+                else:
+                    raise ValueError(f"Patch '{patch_id}' has already been approved and cannot be rejected.")
+            if existing.status == "rejected":
+                raise ValueError(f"Patch '{patch_id}' has already been rejected and cannot be modified or validated.")
+            raise ValueError(f"Patch '{patch_id}' is in state '{existing.status}' and cannot be transitioned.")
 
-        if patch.status in ("approved", "validated"):
-            if action == "approve":
-                raise ValueError(f"Patch '{patch_id}' has already been approved. Duplicate validation is blocked.")
-            else:
-                raise ValueError(f"Patch '{patch_id}' has already been approved and cannot be rejected.")
+        # Re-fetch updated patch with validation runs loaded
+        patch_res = await db.execute(
+            select(PatchProposal)
+            .options(selectinload(PatchProposal.validation_runs))
+            .where(PatchProposal.id == patch_id)
+        )
+        patch = patch_res.scalar_one()
 
+        # Update investigation status
         inv_res = await db.execute(
             select(Investigation).where(Investigation.id == investigation_id)
         )
         inv = inv_res.scalar_one_or_none()
-        now = datetime.now(timezone.utc)
-
-        if action == "reject":
-            patch.status = "rejected"
-            patch.rejected_at = now
-            patch.rejection_reason = reason or "Rejected by human operator"
-            if inv:
+        if inv:
+            if action == "reject":
                 inv.status = "inconclusive"
                 inv.stage = "report_generation"
+            else:
+                inv.status = "validating"
+                inv.stage = "validation"
             await db.commit()
+
+        if action == "reject":
             self.broadcast(investigation_id, {
                 "event_type": "patch_rejected",
-                "title": f"Patch Rejected by User: {patch.target_file}",
-                "payload": {"patch_id": patch.id, "reason": reason, "rejected_at": now.isoformat()}
+                "title": f"Patch Rejected by Operator: {patch.target_file}",
+                "payload": {
+                    "patch_id": patch.id,
+                    "reason": patch.rejection_reason,
+                    "rejected_at": now.isoformat(),
+                    "authorized_by": approver_identity
+                }
             })
             return patch
 
-        # Approved action: record explicit human approval metadata
-        patch.status = "approved"
-        patch.approved_by = authorized_by or "human_operator"
-        patch.approved_at = now
-        if inv:
-            inv.status = "validating"
-            inv.stage = "validation"
-        await db.commit()
-
+        # Approved action
         self.broadcast(investigation_id, {
             "event_type": "patch_approved",
             "title": f"Patch Approved for Isolated Validation: {patch.target_file}",
             "payload": {
                 "patch_id": patch.id,
                 "approved_by": patch.approved_by,
-                "approved_at": patch.approved_at.isoformat()
+                "approved_at": patch.approved_at.isoformat() if patch.approved_at else None
             }
         })
 
-        # Launch validation in background
+        # Concurrency guard for background validation dispatch
+        async with self._validation_lock:
+            if patch_id in self._active_validations:
+                logger.warning(f"Validation for patch '{patch_id}' is already active. Ignoring duplicate dispatch.")
+                return patch
+            self._active_validations.add(patch_id)
+
+        # Launch background validation using privileged validation service
         asyncio.create_task(self._validate_patch_background(investigation_id, patch.id))
         return patch
 
     async def _validate_patch_background(self, investigation_id: str, patch_id: str) -> None:
-        async with AsyncSessionLocal() as session:
-            patch_res = await session.execute(
-                select(PatchProposal).where(PatchProposal.id == patch_id)
-            )
-            patch = patch_res.scalar_one_or_none()
-            if not patch or patch.status != "approved":
-                # Strict security gate: only execute validation if patch is persisted as approved
-                return
+        """
+        Executes validation via PrivilegedValidationService in a background task.
+        Safely captures failures to prevent patches from being stranded in 'validating' state.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                val_run = await privileged_validation_service.execute_approved_patch_validation(
+                    db=session,
+                    investigation_id=investigation_id,
+                    patch_id=patch_id
+                )
+                self.broadcast(investigation_id, {
+                    "event_type": "validation_result",
+                    "title": f"Validation Completed: {val_run.status.upper()}",
+                    "payload": {
+                        "validation_id": val_run.id,
+                        "status": val_run.status,
+                        "exit_code": val_run.exit_code,
+                        "test_summary": val_run.test_summary,
+                        "authorized_by": val_run.authorized_by
+                    }
+                })
+        except Exception as e:
+            logger.error(f"Background validation failed for patch {patch_id}: {e}", exc_info=True)
+            # Recovery: ensure patch and investigation state do not stay stranded
+            try:
+                async with AsyncSessionLocal() as recovery_session:
+                    p_res = await recovery_session.execute(
+                        select(PatchProposal).where(PatchProposal.id == patch_id)
+                    )
+                    p = p_res.scalar_one_or_none()
+                    if p and p.status == "approved":
+                        failed_run = ValidationRun(
+                            investigation_id=investigation_id,
+                            patch_id=patch_id,
+                            status="failed",
+                            exit_code=1,
+                            stdout="",
+                            stderr=f"Validation execution failed: {str(e)}",
+                            authorized_by=p.approved_by,
+                            authorized_at=p.approved_at
+                        )
+                        recovery_session.add(failed_run)
+                        p.status = "validation_failed"
 
-            inv_res = await session.execute(
-                select(Investigation).where(Investigation.id == investigation_id)
-            )
-            inv = inv_res.scalar_one_or_none()
-            proj_res = await session.execute(
-                select(Project).where(Project.id == inv.project_id)
-            )
-            project = proj_res.scalar_one_or_none()
+                        i_res = await recovery_session.execute(
+                            select(Investigation).where(Investigation.id == investigation_id)
+                        )
+                        i = i_res.scalar_one_or_none()
+                        if i:
+                            i.status = "inconclusive"
+                            i.stage = "report_generation"
 
-            project_dir = str(settings.UPLOADS_DIR / project.id)
+                        await recovery_session.commit()
 
-            # Determine test command: prefer pytest, or test the entrypoint
-            test_cmd = ["pytest"]
-            val_res = await tool_registry.execute_tool(
-                tool_name="validate_patch",
-                project_path=project_dir,
-                arguments={
-                    "target_file": patch.target_file,
-                    "original_snippet": patch.original_code_context,
-                    "replacement_code": patch.proposed_code,
-                    "test_command": test_cmd
-                },
-                investigation_id=investigation_id,
-                caller_role="human_approved_workflow",
-                execution_context={
-                    "patch_id": patch.id,
-                    "authorized_by": patch.approved_by,
-                    "authorized_at": patch.approved_at.isoformat() if patch.approved_at else None
-                }
-            )
-
-            v_data = val_res.data
-            status = v_data.get("validation_status", "failed")
-
-            val_run = ValidationRun(
-                investigation_id=investigation_id,
-                patch_id=patch.id,
-                status=status,
-                exit_code=v_data.get("exit_code", -1),
-                stdout=v_data.get("stdout", ""),
-                stderr=v_data.get("stderr", ""),
-                test_summary=v_data.get("test_summary", {}),
-                regression_results=v_data.get("regression_results", {}),
-                execution_time_ms=val_res.execution_time_ms,
-                authorized_by=patch.approved_by,
-                authorized_at=patch.approved_at
-            )
-            session.add(val_run)
-
-            if status == "passed":
-                patch.status = "validated"
-                inv.status = "completed"
-                inv.stage = "regression_testing"
-            else:
-                patch.status = "validation_failed"
-                inv.status = "inconclusive"
-                inv.stage = "report_generation"
-
-            await session.commit()
-
-            self.broadcast(investigation_id, {
-                "event_type": "validation_result",
-                "title": f"Validation Completed: {status.upper()}",
-                "payload": {
-                    "validation_id": val_run.id,
-                    "status": status,
-                    "exit_code": val_run.exit_code,
-                    "test_summary": val_run.test_summary,
-                    "summary": val_res.summary,
-                    "authorized_by": val_run.authorized_by
-                }
-            })
+                        self.broadcast(investigation_id, {
+                            "event_type": "validation_result",
+                            "title": "Validation Failed: System Error",
+                            "payload": {
+                                "validation_id": failed_run.id,
+                                "status": "failed",
+                                "exit_code": 1,
+                                "error": str(e),
+                                "authorized_by": p.approved_by
+                            }
+                        })
+            except Exception as persist_err:
+                logger.error(f"Failed to record validation failure state: {persist_err}")
+        finally:
+            async with self._validation_lock:
+                self._active_validations.discard(patch_id)
 
 
 investigation_service = InvestigationService()
-

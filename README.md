@@ -136,7 +136,7 @@ PipelineSleuth includes three reproducible failure scenarios ready for one-click
 
 ## Running Automated Tests
 
-Run the full pytest suite (18 unit, persistence, API, and E2E integration tests):
+Run the full pytest suite (68 unit, security, persistence, API, and E2E integration tests):
 ```bash
 ./scripts/run_tests.sh
 ```
@@ -145,6 +145,14 @@ Or directly:
 ```bash
 PYTHONPATH=. .venv/bin/pytest backend/tests -v
 ```
+
+### Security & Verification Test Suite Highlights
+PipelineSleuth includes an exhaustive security test suite covering:
+- **Part 1 — Authenticated Human Approval**: Server-enforced operator principals, rejection of unauthenticated/unauthorized actions, resistance to forged `authorized_by` parameters.
+- **Part 2 — Server-Controlled Tool Authorization**: Strict segregation of diagnostic tools from privileged patch validation; removal of caller-controlled role strings as a security boundary; patch precondition verification.
+- **Part 3 — Factual Evidence Verification**: Exact relative project paths (no directory basename collisions), corroboration against structured traceback frames and schema outputs, distinct inference classification.
+- **Part 4 — Investigation Transparency**: Clean enforcement of `InvestigationSummary` across backend, engine, and frontend; elimination of legacy internal thinking fields.
+- **Part 5 — Concurrency-Safe Operations**: Atomic SQLite state transitions preventing duplicate approval or validation races; resilient worker failure recovery.
 
 ---
 

@@ -270,9 +270,6 @@ export const WorkspacePage: React.FC = () => {
                       {ev.payload.next_steps && (
                         <p className="text-charcoal-300"><span className="text-charcoal-400 font-semibold">Next Step:</span> {ev.payload.next_steps}</p>
                       )}
-                      {!ev.payload.focus && ev.payload.thinking && (
-                        <p className="italic text-charcoal-300">{ev.payload.thinking}</p>
-                      )}
                       {ev.payload.summary && (
                         <p className="text-emerald-300">{ev.payload.summary}</p>
                       )}

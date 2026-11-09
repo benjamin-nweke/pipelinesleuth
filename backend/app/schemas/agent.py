@@ -2,7 +2,7 @@
 Structured Pydantic models for Agent Actions, Reasoning, and Decision Making
 """
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
 class ToolCallRequest(BaseModel):
@@ -74,10 +74,6 @@ class AgentDecision(BaseModel):
         ...,
         description="Concise user-facing investigation summary explaining focus, rationale, findings, and plan"
     )
-    thinking: Optional[str] = Field(
-        None,
-        description="Legacy internal thinking field (mirrored from investigation_summary.investigation_focus)"
-    )
     current_stage: Literal[
         "context_collection",
         "artifact_inspection",
@@ -108,27 +104,4 @@ class AgentDecision(BaseModel):
     
     confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Overall confidence in root cause diagnosis")
     confidence_justification: str = Field("", description="Why this confidence score is warranted by collected evidence")
-
-    @model_validator(mode="before")
-    @classmethod
-    def reconcile_summary_and_thinking(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            # If investigation_summary is missing but thinking is provided, populate investigation_summary
-            if "investigation_summary" not in data or not data["investigation_summary"]:
-                thinking_val = data.get("thinking") or "Investigating pipeline failure"
-                data["investigation_summary"] = {
-                    "investigation_focus": thinking_val,
-                    "tool_selection_reason": None,
-                    "finding_summary": None,
-                    "hypothesis_impact": None,
-                    "next_steps": None,
-                    "conclusion_rationale": None
-                }
-            if not data.get("thinking"):
-                inv_sum = data.get("investigation_summary")
-                if isinstance(inv_sum, dict):
-                    data["thinking"] = inv_sum.get("investigation_focus", "")
-                elif hasattr(inv_sum, "investigation_focus"):
-                    data["thinking"] = getattr(inv_sum, "investigation_focus", "")
-        return data
 
