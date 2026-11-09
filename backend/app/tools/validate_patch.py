@@ -6,10 +6,82 @@ Returns genuine process exit code, stdout, stderr, and test summary.
 """
 import time
 import re
+import os
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from backend.app.tools.base import BaseDiagnosticTool, DiagnosticToolDefinition, ToolParameter, ToolResult
 from backend.app.sandbox.manager import sandbox_manager
+
+
+def validate_and_resolve_target_file(
+    workspace_root: Path,
+    target_file_rel: str
+) -> Tuple[bool, Optional[Path], Optional[str]]:
+    """
+    Rigorously validates and resolves a target file path within the candidate workspace.
+    Guarantees:
+    - Path must be non-empty and non-blank
+    - Rejects absolute paths (e.g. /etc/passwd)
+    - Rejects parent directory traversal (..)
+    - Rejects null bytes
+    - Normalizes the path
+    - Resolves within workspace_root and confirms strict containment
+    - Rejects any symlinks traversing outside the workspace
+    - Ensures the file exists and is a regular file
+    """
+    if not target_file_rel or not isinstance(target_file_rel, str) or not target_file_rel.strip():
+        return False, None, "Target file path must be a non-empty string."
+
+    if "\x00" in target_file_rel:
+        return False, None, "Security error: Null byte detected in file path."
+
+    raw_path = Path(target_file_rel)
+
+    # 1. Reject absolute paths
+    if raw_path.is_absolute() or target_file_rel.startswith(("/", "\\")):
+        return False, None, f"Security error: Absolute target paths are forbidden: '{target_file_rel}'"
+
+    # 2. Reject '..' traversal anywhere in the path components
+    if ".." in raw_path.parts:
+        return False, None, f"Security error: Path traversal ('..') is strictly forbidden: '{target_file_rel}'"
+
+    # 3. Clean and normalize
+    clean_rel = os.path.normpath(target_file_rel)
+    if clean_rel.startswith("..") or clean_rel == ".":
+        return False, None, f"Security error: Invalid normalized target path: '{target_file_rel}'"
+
+    ws_resolved = workspace_root.resolve()
+    candidate_path = (ws_resolved / clean_rel).resolve()
+
+    # 4. Strict workspace containment check
+    try:
+        candidate_path.relative_to(ws_resolved)
+    except ValueError:
+        return False, None, f"Security error: Target file resolves outside candidate workspace: '{target_file_rel}'"
+
+    if not str(candidate_path).startswith(str(ws_resolved) + os.sep) and candidate_path != ws_resolved:
+        return False, None, f"Security error: Target path escapes candidate workspace: '{target_file_rel}'"
+
+    # 5. Check for symlink traversal
+    curr = ws_resolved
+    for part in Path(clean_rel).parts:
+        curr = curr / part
+        if curr.is_symlink():
+            resolved_link = curr.resolve()
+            try:
+                resolved_link.relative_to(ws_resolved)
+            except ValueError:
+                return False, None, f"Security error: Symlink traversal detected in target path: '{target_file_rel}'"
+
+    # 6. Check existence
+    if not candidate_path.exists():
+        return False, None, f"Target file '{clean_rel}' not found in candidate workspace."
+
+    # 7. Verify regular file (reject directories, devices, etc.)
+    if not candidate_path.is_file():
+        return False, None, f"Security error: Target path '{clean_rel}' is not a regular file."
+
+    return True, candidate_path, None
 
 
 class ValidatePatchTool(BaseDiagnosticTool):
@@ -18,7 +90,7 @@ class ValidatePatchTool(BaseDiagnosticTool):
         "Validates an approved patch by creating an isolated candidate workspace copy, applying the patch, "
         "and running test suites and pipeline execution. Reports actual exit codes, stdout, stderr, and regressions."
     )
-    permission_level = "sandboxed_exec"
+    permission_level = "human_approval_required"
     timeout_seconds = 60
 
     def get_definition(self) -> DiagnosticToolDefinition:
@@ -93,13 +165,15 @@ class ValidatePatchTool(BaseDiagnosticTool):
         )
 
         try:
-            # 2. Apply patch in candidate workspace
-            candidate_file = Path(candidate_ws) / target_file_rel
-            if not candidate_file.exists():
+            # 2. Securely validate and resolve target path in candidate workspace
+            is_valid, candidate_file, path_err = validate_and_resolve_target_file(
+                Path(candidate_ws), target_file_rel
+            )
+            if not is_valid or candidate_file is None:
                 return ToolResult(
                     success=False,
-                    summary=f"Candidate file '{target_file_rel}' not found in isolated workspace.",
-                    error="File missing in workspace copy.",
+                    summary=f"Path validation failed: {path_err}",
+                    error=path_err,
                     execution_time_ms=int((time.time() - start_time) * 1000)
                 )
 

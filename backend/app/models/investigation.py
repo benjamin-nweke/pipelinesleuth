@@ -3,7 +3,7 @@ Investigation, InvestigationEvent, EvidenceRecord, Hypothesis, and ToolExecution
 """
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, JSON
+from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, ForeignKey, Text, JSON
 from sqlalchemy.orm import relationship
 from backend.app.database.session import Base
 
@@ -61,11 +61,14 @@ class EvidenceRecord(Base):
     execution_stage = Column(String(100), nullable=True)
     observation = Column(Text, nullable=False)
     associated_hypothesis_id = Column(String(36), ForeignKey("hypotheses.id", ondelete="SET NULL"), nullable=True)
-    verification_status = Column(String(50), default="verified", nullable=False)
+    tool_execution_id = Column(String(36), ForeignKey("tool_executions.id", ondelete="SET NULL"), nullable=True)
+    is_inference = Column(Boolean, default=False, nullable=False)
+    verification_status = Column(String(50), default="unverified", nullable=False)  # verified, unverified, inference
     timestamp = Column(DateTime, default=utcnow, nullable=False)
 
     investigation = relationship("Investigation", back_populates="evidence_records")
     hypothesis = relationship("Hypothesis", back_populates="evidence_items")
+    tool_execution = relationship("ToolExecution")
 
 
 class Hypothesis(Base):

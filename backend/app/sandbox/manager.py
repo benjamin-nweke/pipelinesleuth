@@ -46,30 +46,43 @@ class SandboxManager:
         """
         Creates a distinct, temporary workspace copy of the project artifacts.
         Never touches the original project files.
+        Verifies containment and rejects escaping symlinks.
         """
+        source_path = Path(source_project_path).resolve()
+        if not source_path.exists() or not source_path.is_dir():
+            raise ValueError(f"Source project path '{source_project_path}' does not exist or is not a directory.")
+
         workspace_id = candidate_name or f"ws_{uuid.uuid4().hex[:10]}"
-        dest_dir = self.workspaces_root / workspace_id
+        dest_dir = (self.workspaces_root / workspace_id).resolve()
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        source_path = Path(source_project_path)
-        # Copy project files safely (skipping virtualenvs and git)
+        # Copy project files safely (skipping virtualenvs, git, and escaping symlinks)
         for item in source_path.iterdir():
             if item.name in (".git", "venv", ".venv", "__pycache__", ".pytest_cache", "node_modules"):
                 continue
+
+            # Symlink safety: if item is a symlink, verify target remains inside source_path
+            if item.is_symlink():
+                resolved_link = item.resolve()
+                if not str(resolved_link).startswith(str(source_path) + os.sep) and resolved_link != source_path:
+                    continue  # Refuse to copy symlinks escaping source project
+
             dest_item = dest_dir / item.name
             if item.is_dir():
-                shutil.copytree(item, dest_item, dirs_exist_ok=True)
-            else:
+                shutil.copytree(item, dest_item, dirs_exist_ok=True, symlinks=False)
+            elif item.is_file():
                 shutil.copy2(item, dest_item)
 
         return str(dest_dir)
 
     def cleanup_workspace(self, workspace_path: str) -> None:
-        """Safely removes the temporary candidate workspace."""
+        """Safely removes the temporary candidate workspace within workspaces_root."""
         try:
-            w_path = Path(workspace_path)
-            if w_path.exists() and str(w_path).startswith(str(self.workspaces_root)):
-                shutil.rmtree(w_path, ignore_errors=True)
+            w_path = Path(workspace_path).resolve()
+            ws_root = self.workspaces_root.resolve()
+            if w_path.exists() and (str(w_path).startswith(str(ws_root) + os.sep) or w_path == ws_root):
+                if w_path != ws_root:  # Never delete workspaces root itself
+                    shutil.rmtree(w_path, ignore_errors=True)
         except Exception:
             pass
 
@@ -103,20 +116,36 @@ class SandboxManager:
                 "error": "Docker unavailable"
             }
 
-        # Build restricted docker run command
+        # Generate distinct container name to ensure process termination on timeout
+        container_name = f"ps_sandbox_{uuid.uuid4().hex[:12]}"
+        workspace_resolved = str(Path(workspace_path).resolve())
+
+        # Build hardened restricted docker run command
         # Security controls:
         # --rm: clean container after run
+        # --name: distinct container name for lifecycle management
         # --network none: strictly no network access
+        # --cap-drop=ALL: drop all unnecessary Linux kernel capabilities
+        # --security-opt=no-new-privileges:true: prevent privilege escalation
+        # --pids-limit 100: prevent fork bombs
         # --memory 1g: capped memory
         # --cpus 1.0: capped CPU
-        # -v workspace: mounted only to working directory
+        # --read-only: read-only root filesystem
+        # --tmpfs /tmp: writable temporary execution storage with noexec/nosuid
+        # -v workspace: candidate workspace as the ONLY writable project mount
         # -w /workspace: working directory
         docker_cmd = [
             "docker", "run", "--rm",
+            "--name", container_name,
             "--network", "none",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true",
+            "--pids-limit", "100",
             "--memory", settings.SANDBOX_MEMORY_LIMIT,
             "--cpus", "1.0",
-            "-v", f"{Path(workspace_path).resolve()}:/workspace:rw",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "-v", f"{workspace_resolved}:/workspace:rw",
             "-w", "/workspace",
             self.docker_image
         ] + command
@@ -142,6 +171,16 @@ class SandboxManager:
         except asyncio.TimeoutError:
             try:
                 proc.kill()
+            except Exception:
+                pass
+            # Guarantee container is terminated on docker daemon
+            try:
+                kill_proc = await asyncio.create_subprocess_exec(
+                    "docker", "rm", "-f", container_name,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                await asyncio.wait_for(kill_proc.communicate(), timeout=3.0)
             except Exception:
                 pass
             return {

@@ -155,11 +155,13 @@ async def handle_patch_action(
             investigation_id=investigation_id,
             patch_id=patch_id,
             action=req.action,
-            reason=req.reason
+            reason=req.reason,
+            authorized_by=req.authorized_by
         )
         return updated
     except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve))
+        status_code = 404 if "not found" in str(ve).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

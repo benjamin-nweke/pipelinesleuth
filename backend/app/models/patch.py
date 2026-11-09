@@ -26,6 +26,10 @@ class PatchProposal(Base):
     expected_impact = Column(Text, nullable=True)
     potential_risks = Column(Text, nullable=True)
     status = Column(String(50), default="proposed", nullable=False)  # proposed, approved, rejected, validated
+    approved_by = Column(String(100), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
+    rejection_reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     investigation = relationship("Investigation", back_populates="patches")
@@ -45,6 +49,8 @@ class ValidationRun(Base):
     test_summary = Column(JSON, default=dict)
     regression_results = Column(JSON, default=dict)
     execution_time_ms = Column(Integer, default=0)
+    authorized_by = Column(String(100), nullable=True)
+    authorized_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
     patch = relationship("PatchProposal", back_populates="validation_runs")

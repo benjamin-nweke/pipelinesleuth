@@ -2,7 +2,7 @@
 Structured Pydantic models for Agent Actions, Reasoning, and Decision Making
 """
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ToolCallRequest(BaseModel):
@@ -18,6 +18,8 @@ class AgentEvidenceInput(BaseModel):
     execution_stage: Optional[str] = Field(None, description="Pipeline stage name")
     observation: str = Field(..., description="Factual observation derived directly from tool output")
     associated_hypothesis_id: Optional[str] = Field(None, description="Hypothesis ID this evidence supports or addresses")
+    tool_execution_id: Optional[str] = Field(None, description="Traceable identifier of the tool execution yielding this evidence")
+    is_inference: bool = Field(False, description="Whether this is an inferential interpretation rather than a direct empirical observation")
 
 
 class AgentHypothesisInput(BaseModel):
@@ -49,6 +51,15 @@ class AgentReportInput(BaseModel):
     next_steps: List[str] = Field(default_factory=list, description="Recommended production actions or monitoring")
 
 
+class InvestigationSummary(BaseModel):
+    investigation_focus: str = Field(..., description="What specific failure mechanism, artifact, or stage the agent is actively investigating")
+    tool_selection_reason: Optional[str] = Field(None, description="Concise rationale for why the selected diagnostic tool was chosen")
+    finding_summary: Optional[str] = Field(None, description="Concise summary of what recent diagnostic outputs or observations revealed")
+    hypothesis_impact: Optional[str] = Field(None, description="How current findings support, refute, or shape hypotheses")
+    next_steps: Optional[str] = Field(None, description="What the agent intends to investigate next")
+    conclusion_rationale: Optional[str] = Field(None, description="Concise justification for final diagnosis or inconclusive finding")
+
+
 class AgentDecision(BaseModel):
     """
     Every reasoning turn of the agent outputs a structured AgentDecision.
@@ -59,7 +70,14 @@ class AgentDecision(BaseModel):
     4. Propose a patch
     5. Conclude investigation with report or inconclusive verdict
     """
-    thinking: str = Field(..., description="Internal chain of investigative reasoning and reflection on evidence")
+    investigation_summary: InvestigationSummary = Field(
+        ...,
+        description="Concise user-facing investigation summary explaining focus, rationale, findings, and plan"
+    )
+    thinking: Optional[str] = Field(
+        None,
+        description="Legacy internal thinking field (mirrored from investigation_summary.investigation_focus)"
+    )
     current_stage: Literal[
         "context_collection",
         "artifact_inspection",
@@ -90,4 +108,27 @@ class AgentDecision(BaseModel):
     
     confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Overall confidence in root cause diagnosis")
     confidence_justification: str = Field("", description="Why this confidence score is warranted by collected evidence")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reconcile_summary_and_thinking(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # If investigation_summary is missing but thinking is provided, populate investigation_summary
+            if "investigation_summary" not in data or not data["investigation_summary"]:
+                thinking_val = data.get("thinking") or "Investigating pipeline failure"
+                data["investigation_summary"] = {
+                    "investigation_focus": thinking_val,
+                    "tool_selection_reason": None,
+                    "finding_summary": None,
+                    "hypothesis_impact": None,
+                    "next_steps": None,
+                    "conclusion_rationale": None
+                }
+            if not data.get("thinking"):
+                inv_sum = data.get("investigation_summary")
+                if isinstance(inv_sum, dict):
+                    data["thinking"] = inv_sum.get("investigation_focus", "")
+                elif hasattr(inv_sum, "investigation_focus"):
+                    data["thinking"] = getattr(inv_sum, "investigation_focus", "")
+        return data
 

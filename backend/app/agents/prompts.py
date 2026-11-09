@@ -31,7 +31,14 @@ propose concrete code corrections, and test those corrections in an isolated env
 ### YOUR OUTPUT FORMAT:
 You MUST respond with a single valid JSON object matching the AgentDecision schema:
 {{
-  "thinking": "Your in-depth reasoning, interpreting recent tool outputs, identifying evidence gaps, and deciding next steps.",
+  "investigation_summary": {{
+    "investigation_focus": "Specific failure mechanism or file being investigated",
+    "tool_selection_reason": "Why the selected diagnostic tool is being invoked",
+    "finding_summary": "What the recent diagnostic output revealed",
+    "hypothesis_impact": "Which hypothesis is supported or contradicted",
+    "next_steps": "What you intend to investigate next",
+    "conclusion_rationale": "Justification for final conclusion (if concluding)"
+  }},
   "current_stage": "one of: context_collection, artifact_inspection, failure_localization, hypothesis_generation, diagnostic_selection, evidence_collection, hypothesis_testing, root_cause_assessment, patch_generation, awaiting_approval, validation, regression_testing, report_generation",
   "hypotheses": [
     {{
@@ -50,8 +57,10 @@ You MUST respond with a single valid JSON object matching the AgentDecision sche
       "line_number": 42,
       "column_name": "<column_name_or_none>",
       "execution_stage": "transform",
-      "observation": "Factual finding from tool output",
-      "associated_hypothesis_id": "HYP-01"
+      "observation": "Factual finding directly matching tool output",
+      "associated_hypothesis_id": "HYP-01",
+      "tool_execution_id": null,
+      "is_inference": false
     }}
   ],
   "action_type": "call_tool | propose_patch | conclude_success | conclude_inconclusive | request_info",

@@ -19,6 +19,8 @@ class ValidationRunRead(BaseModel):
     test_summary: Dict[str, Any] = Field(default_factory=dict)
     regression_results: Dict[str, Any] = Field(default_factory=dict)
     execution_time_ms: int
+    authorized_by: Optional[str] = None
+    authorized_at: Optional[datetime] = None
     created_at: datetime
 
 
@@ -36,6 +38,10 @@ class PatchProposalRead(BaseModel):
     expected_impact: Optional[str] = None
     potential_risks: Optional[str] = None
     status: str
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    rejected_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
     created_at: datetime
     validation_runs: List[ValidationRunRead] = Field(default_factory=list)
 
@@ -43,3 +49,4 @@ class PatchProposalRead(BaseModel):
 class PatchActionRequest(BaseModel):
     action: str = Field(..., pattern="^(approve|reject)$")
     reason: Optional[str] = None
+    authorized_by: Optional[str] = "human_operator"

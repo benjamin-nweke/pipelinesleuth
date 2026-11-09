@@ -254,8 +254,23 @@ export const WorkspacePage: React.FC = () => {
 
                   {/* Payload detail rendering */}
                   {ev.payload && (
-                    <div className="bg-charcoal-900/90 rounded p-2 text-charcoal-300 font-mono text-[11px] leading-relaxed border border-charcoal-800">
-                      {ev.payload.thinking && (
+                    <div className="bg-charcoal-900/90 rounded p-2 text-charcoal-300 font-mono text-[11px] leading-relaxed border border-charcoal-800 space-y-1">
+                      {ev.payload.focus && (
+                        <p className="text-sky-300"><span className="text-charcoal-400 font-semibold">Focus:</span> {ev.payload.focus}</p>
+                      )}
+                      {ev.payload.tool_reason && (
+                        <p className="text-sleuth-amber-300"><span className="text-charcoal-400 font-semibold">Diagnostic Rationale:</span> {ev.payload.tool_reason}</p>
+                      )}
+                      {ev.payload.finding_summary && (
+                        <p className="text-emerald-300"><span className="text-charcoal-400 font-semibold">Findings:</span> {ev.payload.finding_summary}</p>
+                      )}
+                      {ev.payload.hypothesis_impact && (
+                        <p className="text-purple-300"><span className="text-charcoal-400 font-semibold">Hypothesis Impact:</span> {ev.payload.hypothesis_impact}</p>
+                      )}
+                      {ev.payload.next_steps && (
+                        <p className="text-charcoal-300"><span className="text-charcoal-400 font-semibold">Next Step:</span> {ev.payload.next_steps}</p>
+                      )}
+                      {!ev.payload.focus && ev.payload.thinking && (
                         <p className="italic text-charcoal-300">{ev.payload.thinking}</p>
                       )}
                       {ev.payload.summary && (

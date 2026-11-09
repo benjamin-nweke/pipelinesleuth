@@ -2,6 +2,7 @@
 Investigation Lifecycle and Event Streaming Service
 """
 import asyncio
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -96,7 +97,8 @@ class InvestigationService:
         investigation_id: str,
         patch_id: str,
         action: str,  # "approve" or "reject"
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        authorized_by: Optional[str] = "human_operator"
     ) -> PatchProposal:
         res = await db.execute(
             select(PatchProposal).where(
@@ -108,13 +110,26 @@ class InvestigationService:
         if not patch:
             raise ValueError(f"Patch '{patch_id}' not found.")
 
+        # Enforce server-side state transitions & prevent duplicate executions
+        if patch.status == "rejected":
+            raise ValueError(f"Patch '{patch_id}' has already been rejected and cannot be modified or validated.")
+
+        if patch.status in ("approved", "validated"):
+            if action == "approve":
+                raise ValueError(f"Patch '{patch_id}' has already been approved. Duplicate validation is blocked.")
+            else:
+                raise ValueError(f"Patch '{patch_id}' has already been approved and cannot be rejected.")
+
         inv_res = await db.execute(
             select(Investigation).where(Investigation.id == investigation_id)
         )
         inv = inv_res.scalar_one_or_none()
+        now = datetime.now(timezone.utc)
 
         if action == "reject":
             patch.status = "rejected"
+            patch.rejected_at = now
+            patch.rejection_reason = reason or "Rejected by human operator"
             if inv:
                 inv.status = "inconclusive"
                 inv.stage = "report_generation"
@@ -122,12 +137,14 @@ class InvestigationService:
             self.broadcast(investigation_id, {
                 "event_type": "patch_rejected",
                 "title": f"Patch Rejected by User: {patch.target_file}",
-                "payload": {"patch_id": patch.id, "reason": reason}
+                "payload": {"patch_id": patch.id, "reason": reason, "rejected_at": now.isoformat()}
             })
             return patch
 
-        # Approved action: trigger isolated candidate validation
+        # Approved action: record explicit human approval metadata
         patch.status = "approved"
+        patch.approved_by = authorized_by or "human_operator"
+        patch.approved_at = now
         if inv:
             inv.status = "validating"
             inv.stage = "validation"
@@ -136,7 +153,11 @@ class InvestigationService:
         self.broadcast(investigation_id, {
             "event_type": "patch_approved",
             "title": f"Patch Approved for Isolated Validation: {patch.target_file}",
-            "payload": {"patch_id": patch.id}
+            "payload": {
+                "patch_id": patch.id,
+                "approved_by": patch.approved_by,
+                "approved_at": patch.approved_at.isoformat()
+            }
         })
 
         # Launch validation in background
@@ -149,6 +170,10 @@ class InvestigationService:
                 select(PatchProposal).where(PatchProposal.id == patch_id)
             )
             patch = patch_res.scalar_one_or_none()
+            if not patch or patch.status != "approved":
+                # Strict security gate: only execute validation if patch is persisted as approved
+                return
+
             inv_res = await session.execute(
                 select(Investigation).where(Investigation.id == investigation_id)
             )
@@ -171,7 +196,13 @@ class InvestigationService:
                     "replacement_code": patch.proposed_code,
                     "test_command": test_cmd
                 },
-                investigation_id=investigation_id
+                investigation_id=investigation_id,
+                caller_role="human_approved_workflow",
+                execution_context={
+                    "patch_id": patch.id,
+                    "authorized_by": patch.approved_by,
+                    "authorized_at": patch.approved_at.isoformat() if patch.approved_at else None
+                }
             )
 
             v_data = val_res.data
@@ -186,7 +217,9 @@ class InvestigationService:
                 stderr=v_data.get("stderr", ""),
                 test_summary=v_data.get("test_summary", {}),
                 regression_results=v_data.get("regression_results", {}),
-                execution_time_ms=val_res.execution_time_ms
+                execution_time_ms=val_res.execution_time_ms,
+                authorized_by=patch.approved_by,
+                authorized_at=patch.approved_at
             )
             session.add(val_run)
 
@@ -209,7 +242,8 @@ class InvestigationService:
                     "status": status,
                     "exit_code": val_run.exit_code,
                     "test_summary": val_run.test_summary,
-                    "summary": val_res.summary
+                    "summary": val_res.summary,
+                    "authorized_by": val_run.authorized_by
                 }
             })
 

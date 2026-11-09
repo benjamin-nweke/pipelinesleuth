@@ -32,6 +32,8 @@ class EvidenceRecordRead(BaseModel):
     execution_stage: Optional[str] = None
     observation: str
     associated_hypothesis_id: Optional[str] = None
+    tool_execution_id: Optional[str] = None
+    is_inference: bool = False
     verification_status: str
     timestamp: datetime
 

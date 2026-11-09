@@ -5,8 +5,12 @@ evidence collection, hypothesis testing, loop prevention, and event broadcasting
 """
 import asyncio
 import json
+import os
+import re
 import time
-from typing import Dict, Any, List, Optional, Callable
+import uuid
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Callable, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -20,6 +24,103 @@ from backend.app.models.project import Project, ProjectFile
 from backend.app.tools.registry import tool_registry
 from backend.app.agents.provider import AIProvider, ModelProviderError
 from backend.app.agents.prompts import INVESTIGATION_SYSTEM_PROMPT
+from backend.app.schemas.agent import AgentEvidenceInput
+
+
+def verify_evidence_against_telemetry(
+    ev_input: AgentEvidenceInput,
+    project_files: List[Any],
+    recent_tool_execs: List[ToolExecution]
+) -> Tuple[str, bool, Optional[str]]:
+    """
+    Rigorously verifies model-submitted evidence against ground-truth project artifacts
+    and empirical tool execution telemetry.
+    Returns: (verification_status, is_inference, matched_tool_execution_id)
+    - "inference": if explicitly marked as inference or speculative reasoning
+    - "unverified": if source file does not exist, line numbers/columns are unsupported,
+                    or observation cannot be corroborated by tool outputs
+    - "verified": only if source file exists, and tool outputs directly corroborate
+                  line numbers, column references, and observation facts.
+    """
+    # 1. Check if explicitly marked or typed as inference
+    if ev_input.is_inference or "inference" in ev_input.evidence_type.lower():
+        return "inference", True, None
+
+    # 2. Verify source file existence in project artifacts
+    src = ev_input.source_file.strip() if ev_input.source_file else ""
+    if not src:
+        return "unverified", False, None
+
+    src_norm = os.path.normpath(src)
+    project_paths = [os.path.normpath(f.relative_path) for f in project_files]
+    file_matches = [
+        p for p in project_paths
+        if p == src_norm or p.endswith("/" + src_norm) or Path(p).name == Path(src_norm).name
+    ]
+    if not file_matches:
+        # Non-existent or hallucinated source file
+        return "unverified", False, None
+
+    # 3. Match against tool execution telemetry
+    matched_exec: Optional[ToolExecution] = None
+
+    if ev_input.tool_execution_id:
+        for te in recent_tool_execs:
+            if te.id == ev_input.tool_execution_id:
+                matched_exec = te
+                break
+
+    # If no explicit ID or ID not found, search recent tool executions for corroboration
+    candidate_execs = [matched_exec] if matched_exec else recent_tool_execs
+
+    for te in candidate_execs:
+        if not te or not te.output_result:
+            continue
+
+        out_data = te.output_result
+        out_str = json.dumps(out_data)
+
+        # Check line number if specified
+        if ev_input.line_number is not None:
+            line_str = str(ev_input.line_number)
+            has_line = False
+            if "tracebacks" in out_data and isinstance(out_data["tracebacks"], list):
+                for tb in out_data["tracebacks"]:
+                    for frame in tb.get("frames", []):
+                        if frame.get("line") == ev_input.line_number:
+                            has_line = True
+                            break
+            if "fatal_error" in out_data and out_data["fatal_error"]:
+                lf = out_data["fatal_error"].get("last_frame")
+                if lf and lf.get("line") == ev_input.line_number:
+                    has_line = True
+            if "functions" in out_data and isinstance(out_data["functions"], list):
+                for fn in out_data["functions"]:
+                    if fn.get("lineno") == ev_input.line_number:
+                        has_line = True
+            if not has_line and f'"line": {line_str}' not in out_str and f'"lineno": {line_str}' not in out_str:
+                # Unsupported line number
+                continue
+
+        # Check column name if specified
+        if ev_input.column_name:
+            col = ev_input.column_name
+            col_in_out = col in out_str or (te.input_arguments and col in json.dumps(te.input_arguments))
+            if not col_in_out:
+                continue
+
+        # Check observation keywords / substance
+        obs_lower = ev_input.observation.lower()
+        stopwords = {"this", "that", "with", "from", "have", "were", "been", "file", "line", "test", "when", "data", "found"}
+        tokens = [w for w in re.findall(r'[a-zA-Z0-9_]{3,}', obs_lower) if w not in stopwords]
+        
+        out_lower = out_str.lower()
+        matching_tokens = [t for t in tokens if t in out_lower]
+
+        if matching_tokens or (ev_input.column_name and ev_input.column_name.lower() in out_lower):
+            return "verified", False, te.id
+
+    return "unverified", False, None
 
 
 class InvestigationEngine:
@@ -102,8 +203,8 @@ class InvestigationEngine:
             {"stage": "context_collection", "objective": investigation.objective}
         )
 
-        # Prepare tool definitions summary for the prompt
-        tool_defs = tool_registry.list_tool_definitions()
+        # Prepare agent tool definitions summary (excluding human-approval-only tools)
+        tool_defs = tool_registry.list_agent_tool_definitions()
         tool_defs_str = "\n".join([
             f"- `{t.name}`: {t.description} (params: {[p.name for p in t.parameters]})"
             for t in tool_defs
@@ -217,12 +318,19 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
             investigation.confidence_justification = decision.confidence_justification
             await self.db.commit()
 
-            # Record thought event
+            # Record user-facing investigation event
+            inv_sum = decision.investigation_summary
             await self.emit_event(
                 "thought",
-                f"Agent Reasoning (Step {loop_counter})",
+                f"Investigation Focus: {inv_sum.investigation_focus}",
                 {
-                    "thinking": decision.thinking,
+                    "focus": inv_sum.investigation_focus,
+                    "tool_reason": inv_sum.tool_selection_reason,
+                    "finding_summary": inv_sum.finding_summary,
+                    "hypothesis_impact": inv_sum.hypothesis_impact,
+                    "next_steps": inv_sum.next_steps,
+                    "conclusion_rationale": inv_sum.conclusion_rationale,
+                    "thinking": inv_sum.investigation_focus,
                     "confidence_score": decision.confidence_score,
                     "stage": decision.current_stage
                 }
@@ -266,8 +374,13 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
                         {"hypothesis_id": new_hyp.id, "status": new_hyp.status, "confidence": new_hyp.confidence}
                     )
 
-            # Process new evidence records
+            # Process new evidence records with independent verification
             for ev_input in decision.new_evidence:
+                v_status, is_inf, matched_tid = verify_evidence_against_telemetry(
+                    ev_input=ev_input,
+                    project_files=project_files,
+                    recent_tool_execs=recent_tool_execs
+                )
                 ev_rec = EvidenceRecord(
                     investigation_id=self.investigation_id,
                     source_file=ev_input.source_file,
@@ -277,20 +390,25 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
                     execution_stage=ev_input.execution_stage,
                     observation=ev_input.observation,
                     associated_hypothesis_id=ev_input.associated_hypothesis_id,
-                    verification_status="verified"
+                    tool_execution_id=matched_tid,
+                    is_inference=is_inf,
+                    verification_status=v_status
                 )
                 self.db.add(ev_rec)
                 await self.db.commit()
                 await self.db.refresh(ev_rec)
                 await self.emit_event(
                     "evidence_found",
-                    f"Evidence Logged: {ev_rec.evidence_type}",
+                    f"Evidence Logged: {ev_rec.evidence_type} ({v_status.upper()})",
                     {
                         "evidence_id": ev_rec.id,
                         "source": ev_rec.source_file,
                         "observation": ev_rec.observation,
                         "line": ev_rec.line_number,
-                        "column": ev_rec.column_name
+                        "column": ev_rec.column_name,
+                        "verification_status": v_status,
+                        "is_inference": is_inf,
+                        "tool_execution_id": matched_tid
                     }
                 )
 
@@ -334,11 +452,15 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
                         tool_name=tool_name,
                         project_path=project_storage_dir,
                         arguments=args,
-                        investigation_id=self.investigation_id
+                        investigation_id=self.investigation_id,
+                        caller_role="agent",
+                        remaining_budget=investigation.remaining_budget
                     )
 
-                    # Persist ToolExecution record
+                    # Persist ToolExecution record with traceable execution ID
+                    exec_id = f"EXEC-{uuid.uuid4().hex[:8].upper()}"
                     t_exec = ToolExecution(
+                        id=exec_id,
                         investigation_id=self.investigation_id,
                         tool_name=tool_name,
                         input_arguments=args,
