@@ -267,9 +267,7 @@ class InvestigationService:
                             await privileged_validation_service.recover_abandoned_validation(
                                 db=session,
                                 investigation_id=p.investigation_id,
-                                patch_id=p.id,
-                                timeout_seconds=0,
-                                force=True
+                                patch_id=p.id
                             )
                             logger.info(f"Startup recovery: Reset abandoned validating patch '{p.id}' back to approved.")
                         except Exception as e:

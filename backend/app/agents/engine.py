@@ -34,6 +34,57 @@ RECOGNIZED_CONTAINER_ROOTS = (
     "/candidate",
 )
 
+CAUSAL_PHRASES = (
+    "caused by",
+    "due to",
+    "because of",
+    "as a result of",
+    "resulting in",
+    "results in",
+    "leads to",
+    "leading to",
+    "triggered by",
+    "triggers",
+    "originates from",
+    "attributed to",
+    "stems from",
+    "reason for",
+    "reason being",
+    "root cause",
+    "consequence of",
+)
+
+BEHAVIORAL_KEYWORDS = frozenset({
+    "drop", "drops", "dropping",
+    "fail", "fails", "failing",
+    "crash", "crashes", "crashing",
+    "corrupt", "corrupts", "corrupting",
+    "bypass", "bypasses", "bypassing",
+    "leak", "leaks", "leaking",
+    "skip", "skips", "skipping",
+    "improper", "incorrectly", "erroneous",
+    "remove", "removes", "removing",
+    "detect", "detects", "detecting",
+    "prevent", "prevents", "preventing",
+    "filter", "filters", "filtering",
+    "sanitize", "sanitizes", "sanitizing",
+    "truncate", "truncates", "truncating",
+    "mutate", "mutates", "mutating",
+    "handle", "handles", "handling"
+})
+
+
+def contains_causal_explanation(text: str) -> bool:
+    """Returns True if the text asserts an explanatory or causal relationship."""
+    t_lower = text.lower()
+    return any(p in t_lower for p in CAUSAL_PHRASES)
+
+
+def contains_behavioral_claim(text: str) -> bool:
+    """Returns True if the text asserts runtime behavior, filtering, mutation, or handling actions."""
+    words = set(re.findall(r'[a-zA-Z0-9_]+', text.lower()))
+    return bool(words & BEHAVIORAL_KEYWORDS)
+
 
 def resolve_frame_to_project_relative(
     frame_file: str,
@@ -82,7 +133,7 @@ def resolve_frame_to_project_relative(
             except Exception:
                 pass
 
-        if candidate_rel is None:
+        if candidate_rel is None and workspace_dir:
             for host_root in [settings.WORKSPACES_DIR, settings.UPLOADS_DIR]:
                 try:
                     hr_resolved = Path(host_root).resolve()
@@ -140,8 +191,9 @@ def verify_evidence_against_telemetry(
     and empirical tool execution telemetry.
     Status rules:
     - "verified": exact claim is supported by authoritative, structured evidence.
-    - "inference": evidence supports a plausible interpretation but does not establish exact claim.
-    - "unverified": available evidence does not establish the claim.
+    - "inference": evidence supports a plausible interpretation or contains causal explanations / behavioral claims,
+                  but does not establish exact empirical claim.
+    - "unverified": available evidence does not establish the claim or violates path containment.
     When uncertain, downgrades to "inference" or "unverified".
     """
     # 1. Explicit inference or speculative hypothesis
@@ -155,6 +207,10 @@ def verify_evidence_against_telemetry(
 
     # Traversal sequence in source_file is immediately unverified
     if ".." in Path(src).parts:
+        return "unverified", False, None
+
+    # Reject absolute source path if workspace_dir is missing
+    if os.path.isabs(src) and workspace_dir is None:
         return "unverified", False, None
 
     src_norm = os.path.normpath(src).lstrip("/\\")
@@ -271,6 +327,8 @@ def verify_evidence_against_telemetry(
 
             # Both exception type OR specific error token must be present, plus non-generic content
             if (matched_exc_type or matched_exc_msg) and non_generic_words:
+                if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "prevents", "sanitizes", "filters", "drops", "bypasses")):
+                    return "inference", True, te.id
                 return "verified", False, te.id
             else:
                 # Uncorroborated by exception type or error tokens
@@ -320,6 +378,8 @@ def verify_evidence_against_telemetry(
                     if not any(num in recorded_nums for num in claimed_numbers):
                         return "unverified", False, None  # Invented statistic
 
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                    return "inference", True, te.id
                 return "verified", False, te.id
 
             elif is_dup_claim:
@@ -328,17 +388,23 @@ def verify_evidence_against_telemetry(
                     return "unverified", False, None
                 if claimed_numbers and not any(str(recorded_dups) == num for num in claimed_numbers):
                     return "unverified", False, None
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                    return "inference", True, te.id
                 return "verified", False, te.id
 
             elif is_row_count_claim:
                 recorded_rows = dataset_stats.get("total_rows", 0)
                 if claimed_numbers and not any(str(recorded_rows) == num for num in claimed_numbers):
                     return "unverified", False, None
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                    return "inference", True, te.id
                 return "verified", False, te.id
 
             elif is_type_claim and col_lower:
                 recorded_type = str(col_profile.get("dtype") or col_profile.get("inferred_type", "")).lower()
                 if recorded_type and recorded_type in obs_lower:
+                    if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                        return "inference", True, te.id
                     return "verified", False, te.id
                 return "unverified", False, None
 
@@ -348,6 +414,8 @@ def verify_evidence_against_telemetry(
                 if claimed_numbers:
                     if not all(num.rstrip('%') in telemetry_str for num in claimed_numbers):
                         return "unverified", False, None
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                    return "inference", True, te.id
                 return "verified", False, te.id
 
             else:
@@ -366,20 +434,10 @@ def verify_evidence_against_telemetry(
             class_dict = {c.get("name", "").lower(): c for c in classes if isinstance(c, dict) and c.get("name")}
             import_names = {str(imp).lower() for imp in imports}
 
-            # Runtime behavioral keywords that CANNOT be established by AST syntax alone
-            behavioral_keywords = {
-                "drop", "drops", "dropping",
-                "fail", "fails", "failing",
-                "crash", "crashes", "crashing",
-                "corrupt", "corrupts", "corrupting",
-                "bypass", "bypasses", "bypassing",
-                "leak", "leaks", "leaking",
-                "skip", "skips", "skipping",
-                "improper", "incorrectly", "erroneous"
-            }
-            is_behavioral_claim = any(bw in obs_lower for bw in behavioral_keywords)
+            # Runtime behavioral or causal keywords that CANNOT be established by AST syntax alone
+            is_behavioral_claim = contains_behavioral_claim(obs_lower) or contains_causal_explanation(obs_lower)
             if is_behavioral_claim:
-                # Do NOT infer runtime behavior from syntax alone!
+                # Do NOT infer runtime behavior or causality from syntax alone!
                 return "inference", True, te.id
 
             line_matched = False
@@ -420,6 +478,8 @@ def verify_evidence_against_telemetry(
 
             if is_direct_claim:
                 if any(dep in obs_lower for dep in direct_deps if len(dep) > 2):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                        return "inference", True, te.id
                     return "verified", False, te.id
                 elif any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
                     # Reverse dependency mistakenly claimed as direct dependency!
@@ -427,14 +487,20 @@ def verify_evidence_against_telemetry(
 
             elif is_reverse_claim:
                 if any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                        return "inference", True, te.id
                     return "verified", False, te.id
 
             elif is_import_claim:
                 if any(imp in obs_lower for imp in imports if len(imp) > 2):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                        return "inference", True, te.id
                     return "verified", False, te.id
 
             elif is_package_claim:
                 if any(pkg in obs_lower for pkg in packages if len(pkg) > 2):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                        return "inference", True, te.id
                     return "verified", False, te.id
 
             else:
@@ -465,16 +531,22 @@ def verify_evidence_against_telemetry(
 
                 if is_missing_claim:
                     if col_lower in missing_cols or col_lower in drift_cols:
+                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                            return "inference", True, te.id
                         return "verified", False, te.id
                     else:
                         return "unverified", False, None
                 elif is_type_claim:
                     if col_lower in type_mismatch_cols:
+                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                            return "inference", True, te.id
                         return "verified", False, te.id
                     else:
                         return "unverified", False, None
                 elif is_new_claim:
                     if col_lower in new_cols or col_lower in drift_cols:
+                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                            return "inference", True, te.id
                         return "verified", False, te.id
                     else:
                         return "unverified", False, None
@@ -486,8 +558,12 @@ def verify_evidence_against_telemetry(
             result_data = out_data.get("result", {}) if isinstance(out_data.get("result"), dict) else out_data
             supported = result_data.get("supported") or out_data.get("supported")
             if supported is True and any(kw in obs_lower for kw in ("support", "confirm", "pass", "valid")):
+                if contains_causal_explanation(obs_lower):
+                    return "inference", True, te.id
                 return "verified", False, te.id
             elif supported is False and any(kw in obs_lower for kw in ("contradict", "reject", "fail", "refut")):
+                if contains_causal_explanation(obs_lower):
+                    return "inference", True, te.id
                 return "verified", False, te.id
 
     return "unverified", False, None

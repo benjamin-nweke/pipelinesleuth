@@ -25,6 +25,13 @@ PROHIBITED_TOKENS = frozenset({
     "ps_admin_token_master",
     "ps_viewer_token_guest",
     "ps_operator_sec_key_2026",
+    "op_sec_token_dev_2026_admin",
+    "op_sec_admin_token_2026_xyz",
+    "<GENERATE_A_SECURE_RANDOM_TOKEN_HERE>",
+    "<GENERATE_SECURE_TOKEN_32_BYTES>",
+    "YOUR_SECURE_OPERATOR_API_KEY_HERE",
+    "YOUR_TOKEN_HERE",
+    "<YOUR_TOKEN_HERE>",
     "admin",
     "password",
     "secret",
@@ -72,6 +79,8 @@ def validate_token_strength(token: str, token_name: str = "Operator token") -> s
         )
     if cleaned in PROHIBITED_TOKENS:
         raise ValueError(f"Security error: {token_name} '{cleaned}' is on the prohibited credentials blocklist.")
+    if "<" in cleaned or ">" in cleaned or "placeholder" in cleaned.lower() or "generate" in cleaned.lower():
+        raise ValueError(f"Security error: {token_name} contains placeholder text. You must generate and deploy a real cryptographically secure random token.")
     if len(set(cleaned)) < 4:
         raise ValueError(f"{token_name} lacks sufficient character diversity/entropy.")
     return cleaned

@@ -42,6 +42,7 @@ from backend.app.database.session import (
     init_db,
     check_supported_database_dialect,
     sync_upgrade_schema,
+    check_validation_runs_unique_index,
 )
 from backend.app.models.project import Project, ProjectFile
 from backend.app.models.investigation import Investigation, ToolExecution
@@ -596,16 +597,17 @@ def test_database_dialect_unsupported_rejected():
 
 def test_operator_tokens_json_valid_configuration():
     """Valid OPERATOR_TOKENS_JSON with canonical principal_id parses successfully."""
+    valid_token = "test_custom_admin_token_2026_valid_entropy"
     valid_json = json.dumps({
-        "op_sec_admin_token_2026_xyz": {
+        valid_token: {
             "principal_id": "operator_admin",
             "role": "operator",
             "scopes": ["patch:approve", "patch:reject"]
         }
     })
     parsed = validate_operator_tokens_json(valid_json)
-    assert "op_sec_admin_token_2026_xyz" in parsed
-    principal = parsed["op_sec_admin_token_2026_xyz"]
+    assert valid_token in parsed
+    principal = parsed[valid_token]
     assert principal.principal_id == "operator_admin"
     assert principal.role == "operator"
     assert "patch:approve" in principal.scopes
@@ -619,8 +621,9 @@ def test_operator_tokens_json_malformed_json_raises():
 
 def test_operator_tokens_json_missing_or_blank_principal_id_raises():
     """Missing or blank canonical principal_id raises ValueError."""
+    test_token = "test_custom_admin_token_2026_valid_entropy"
     json_missing = json.dumps({
-        "op_sec_admin_token_2026_xyz": {
+        test_token: {
             "role": "operator"
         }
     })
@@ -628,7 +631,7 @@ def test_operator_tokens_json_missing_or_blank_principal_id_raises():
         validate_operator_tokens_json(json_missing)
 
     json_blank = json.dumps({
-        "op_sec_admin_token_2026_xyz": {
+        test_token: {
             "principal_id": "   ",
             "role": "operator"
         }
@@ -793,3 +796,292 @@ async def test_genuine_os_process_concurrency_contention(db_session: AsyncSessio
     assert len(successes) == 1, f"Expected exactly 1 successful OS process claim, got: {results}"
     assert len(failures) == 1, f"Expected exactly 1 failed OS process claim, got: {results}"
     assert "already claimed by active worker" in failures[0][2]
+
+
+# ============================================================================
+# 8. FINAL TARGETED AUDIT REMEDIATION TESTS
+# ============================================================================
+
+def test_secrets_token_urlsafe_and_placeholder_rejections():
+    """Instructions recommend secrets.token_urlsafe(32); placeholders are strictly blocked."""
+    import secrets
+    # Generated random token must pass validation
+    gen_token = secrets.token_urlsafe(32)
+    validated = validate_token_strength(gen_token)
+    assert validated == gen_token
+
+    # Placeholder tokens must be rejected
+    placeholders = [
+        "<GENERATE_A_SECURE_RANDOM_TOKEN_HERE>",
+        "<GENERATE_SECURE_TOKEN_32_BYTES>",
+        "YOUR_SECURE_OPERATOR_API_KEY_HERE",
+        "YOUR_TOKEN_HERE",
+        "<YOUR_TOKEN_HERE>",
+        "placeholder_token_value_12345",
+        "generate_random_token_string_here"
+    ]
+    for ph in placeholders:
+        with pytest.raises(ValueError):
+            validate_token_strength(ph)
+
+
+@pytest.mark.asyncio
+async def test_cas_lease_recovery_race_protection(db_session: AsyncSession):
+    """
+    CAS recovery atomic update condition prevents recovery if another worker renewed the lease
+    or changed validation_lease_expires_at in the interim.
+    """
+    proj = Project(name="CAS Race Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="CAS race test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    expired_time = now - timedelta(seconds=10)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="old",
+        proposed_code="new",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="lead_op",
+        approved_at=expired_time,
+        validation_claimed_at=expired_time,
+        validation_lease_expires_at=expired_time,
+        validation_claimed_by="worker_stale",
+        validation_claim_token="claim_token_stale_111"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Worker B concurrently renews the lease in the database to a future time
+    patch.validation_lease_expires_at = now + timedelta(seconds=300)
+    patch.validation_claim_token = "claim_token_renewed_222"
+    await db_session.commit()
+
+    # Worker C's attempt to recover based on expired state is rejected
+    with pytest.raises(ValueError, match="Validation claim is still active"):
+        await privileged_validation_service.recover_abandoned_validation(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_evidence_verification_causal_and_behavioral_downgrades():
+    """
+    Observations containing causal phrases ('caused by', 'due to') or behavioral claims ('removes', 'detects')
+    are downgraded to 'inference' even if other parts match telemetry.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="pipeline.py", file_type="code", size_bytes=100, storage_path="/tmp/f1"),
+        ProjectFile(id="f2", project_id="p1", relative_path="data.csv", file_type="data", size_bytes=100, storage_path="/tmp/f2")
+    ]
+
+    # 1. Traceback with causal claim -> inference
+    te_log = ToolExecution(
+        id="TE-CAUSAL-01",
+        investigation_id="INV-01",
+        tool_name="analyze_logs",
+        status="success",
+        output_result={
+            "fatal_error": {
+                "last_frame": {"file": "pipeline.py", "line": 25},
+                "exception_type": "KeyError",
+                "message": "'customer_id' missing from columns"
+            }
+        }
+    )
+    ev_causal = AgentEvidenceInput(
+        source_file="pipeline.py",
+        evidence_type="log_stacktrace",
+        line_number=25,
+        tool_execution_id="TE-CAUSAL-01",
+        observation="KeyError on customer_id caused by missing upstream schema update"
+    )
+    status, is_inf, _ = verify_evidence_against_telemetry(ev_causal, files, [te_log], investigation_id="INV-01")
+    assert status == "inference"
+    assert is_inf is True
+
+    # 2. Dataset profile with 'due to' -> inference
+    te_prof = ToolExecution(
+        id="TE-CAUSAL-02",
+        investigation_id="INV-01",
+        tool_name="profile_dataset",
+        status="success",
+        output_result={
+            "columns": {"revenue": {"null_count": 5, "null_percentage": 5.0, "dtype": "float64"}}
+        }
+    )
+    ev_null_causal = AgentEvidenceInput(
+        source_file="data.csv",
+        evidence_type="dataset_anomaly",
+        column_name="revenue",
+        tool_execution_id="TE-CAUSAL-02",
+        observation="5 null values in revenue column due to ingestion latency"
+    )
+    s2, is_inf2, _ = verify_evidence_against_telemetry(ev_null_causal, files, [te_prof], investigation_id="INV-01")
+    assert s2 == "inference"
+    assert is_inf2 is True
+
+    # 3. AST code inspection with 'removes' or 'detects' -> inference
+    te_ast = ToolExecution(
+        id="TE-AST-02",
+        investigation_id="INV-01",
+        tool_name="inspect_code",
+        status="success",
+        output_result={
+            "functions": [{"name": "clean_records", "lineno": 40}]
+        }
+    )
+    ev_ast_removes = AgentEvidenceInput(
+        source_file="pipeline.py",
+        evidence_type="code_ast",
+        line_number=40,
+        tool_execution_id="TE-AST-02",
+        observation="clean_records function removes invalid records and detects errors"
+    )
+    s3, is_inf3, _ = verify_evidence_against_telemetry(ev_ast_removes, files, [te_ast], investigation_id="INV-01")
+    assert s3 == "inference"
+    assert is_inf3 is True
+
+
+def test_sqlite_unique_index_metadata_verification():
+    """
+    Directly tests check_validation_runs_unique_index inspecting SQLite index metadata:
+    - Non-unique index named uq_validation_runs_patch_id is identified as non-unique.
+    - Unique index on columns other than ['patch_id'] is rejected.
+    - Irreconcilable conflicting statuses (passed and failed) raise RuntimeError.
+    - Deterministic duplicate remediation produces verified unique index.
+    """
+    import sqlite3
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db_path = f.name
+
+    con = sqlite3.connect(db_path)
+    con.execute("""
+        CREATE TABLE validation_runs (
+            id VARCHAR(36) PRIMARY KEY,
+            investigation_id VARCHAR(36) NOT NULL,
+            patch_id VARCHAR(36) NOT NULL,
+            status VARCHAR(50) NOT NULL,
+            created_at DATETIME
+        )
+    """)
+    con.execute("CREATE TABLE patch_proposals (id VARCHAR(36) PRIMARY KEY)")
+
+    class RealConnWrapper:
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if params:
+                return con.execute(sql, params)
+            return con.execute(sql)
+
+    wrapper = RealConnWrapper()
+
+    # Case 1: Create a non-unique index with the deceptive name "uq_validation_runs_patch_id"
+    con.execute("CREATE INDEX uq_validation_runs_patch_id ON validation_runs (patch_id)")
+    con.commit()
+
+    # Must be recognized as NOT unique
+    assert check_validation_runs_unique_index(wrapper) is False
+
+    # Drop the non-unique index
+    con.execute("DROP INDEX uq_validation_runs_patch_id")
+    con.commit()
+
+    # Case 2: Create a unique index on investigation_id (wrong column)
+    con.execute("CREATE UNIQUE INDEX uq_inv_id ON validation_runs (investigation_id)")
+    con.commit()
+
+    # Must be recognized as NOT matching ['patch_id']
+    assert check_validation_runs_unique_index(wrapper) is False
+
+    con.execute("DROP INDEX uq_inv_id")
+    con.commit()
+
+    # Case 3: Insert conflicting duplicate runs (one passed, one failed)
+    con.execute("INSERT INTO validation_runs (id, investigation_id, patch_id, status, created_at) VALUES ('VR1', 'I1', 'P_CONF', 'passed', '2026-01-01 10:00:00')")
+    con.execute("INSERT INTO validation_runs (id, investigation_id, patch_id, status, created_at) VALUES ('VR2', 'I1', 'P_CONF', 'failed', '2026-01-01 10:05:00')")
+    con.commit()
+
+    with pytest.raises(RuntimeError, match="irreconcilable conflicting statuses"):
+        sync_upgrade_schema(wrapper)
+
+    # Clean up conflicting run and test successful deterministic remediation
+    con.execute("DELETE FROM validation_runs WHERE id = 'VR2'")
+    con.execute("INSERT INTO validation_runs (id, investigation_id, patch_id, status, created_at) VALUES ('VR3', 'I1', 'P_CONF', 'passed', '2026-01-01 10:06:00')")
+    con.commit()
+
+    sync_upgrade_schema(wrapper)
+
+    # Verify unique index was created and is verified by SQLite metadata
+    assert check_validation_runs_unique_index(wrapper) is True
+    con.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_approved_patch_validation_heartbeat_renewal_and_ownership_loss(db_session: AsyncSession):
+    """
+    Tests execute_approved_patch_validation heartbeat renewal and ownership loss protection:
+    - If ownership of the validation claim token is superseded during execution,
+      the validation service detects the loss and aborts the commit.
+    """
+    proj = Project(name="Heartbeat Loss Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Heartbeat loss test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="def run(): pass",
+        proposed_code="def run(): return 42",
+        unified_diff="diff",
+        explanation="expl",
+        status="approved",
+        approved_by="lead_operator",
+        approved_at=now
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Fast renewal test: lease_seconds=1, renewal_interval=0.1
+    from unittest.mock import AsyncMock, patch as mock_patch
+    from backend.app.tools.base import ToolResult
+
+    mock_tool = AsyncMock()
+    async def delayed_execute(*args, **kwargs):
+        # Simulate worker losing claim halfway through execution:
+        # Another process rewrote the validation_claim_token
+        async with AsyncSessionLocal() as tamper_session:
+            await tamper_session.execute(
+                text("UPDATE patch_proposals SET validation_claim_token = 'stolen_token_xyz' WHERE id = :pid"),
+                {"pid": patch.id}
+            )
+            await tamper_session.commit()
+        await asyncio.sleep(0.3)
+        return ToolResult(success=True, summary="Tests passed", data={"stdout": "pass", "exit_code": 0})
+
+    mock_tool.execute = delayed_execute
+
+    with mock_patch("backend.app.services.validation_service.ValidatePatchTool", return_value=mock_tool):
+        with pytest.raises(Exception, match="(ownership.*lost|Security violation)"):
+            await privileged_validation_service.execute_approved_patch_validation(
+                db=db_session,
+                investigation_id=inv.id,
+                patch_id=patch.id,
+                lease_seconds=1,
+                renewal_interval=0.1
+            )
+

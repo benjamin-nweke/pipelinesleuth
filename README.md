@@ -81,18 +81,25 @@ npm run build --prefix frontend
 
 PipelineSleuth enforces zero hardcoded authentication credentials. Privileged patch review actions (approval and rejection) strictly require provisioned operator credentials.
 
-Create or update `.env` in the project root:
+#### Generate Secure Operator Credentials
+Before starting the application, generate a cryptographically random token (minimum 32 bytes of random entropy recommended):
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Create or update `.env` in the project root with your generated credential:
 
 ```env
 # Operator Authorization Credentials (Required for Patch Approval/Rejection)
-# Minimum 16 characters required for entropy
-OPERATOR_API_KEY=op_sec_token_dev_2026_admin
+# Replace placeholder with your generated 32-byte cryptographically secure random token:
+OPERATOR_API_KEY=<GENERATE_A_SECURE_RANDOM_TOKEN_HERE>
 
 # Optional: Multi-Operator Credential Configuration (JSON mapping with canonical principal_id)
-# OPERATOR_TOKENS_JSON='{"op_sec_admin_token_2026_xyz": {"principal_id": "operator_admin", "role": "operator", "scopes": ["patch:approve", "patch:reject"]}}'
+# OPERATOR_TOKENS_JSON='{"<GENERATE_A_SECURE_RANDOM_TOKEN_HERE>": {"principal_id": "operator_admin", "role": "operator", "scopes": ["patch:approve", "patch:reject"]}}'
 ```
 
-- **Validation at Startup**: Operator credentials are strictly validated during application startup. Malformed JSON, tokens shorter than 16 characters, missing or blank canonical `principal_id`, and tokens on the prohibited blocklist cause immediate startup failure.
+- **Validation at Startup**: Operator credentials are strictly validated during application startup. Malformed JSON, tokens shorter than 16 characters, missing or blank canonical `principal_id`, literal placeholder strings, and tokens on the prohibited blocklist cause immediate startup failure.
 - **Unprovisioned State**: If no operator credentials are configured, privileged endpoints refuse all unauthenticated requests with `401 Unauthorized`.
 - **Database Engine**: PipelineSleuth is currently built and supported **strictly on SQLite** (`sqlite+aiosqlite:///storage/pipelinesleuth.db`). The startup lifecycle inspects `DATABASE_URL` and fails early with a clear error if external dialects (such as PostgreSQL or MySQL) are configured.
 

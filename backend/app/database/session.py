@@ -72,6 +72,27 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+def check_validation_runs_unique_index(connection) -> bool:
+    """
+    Directly inspects SQLite index metadata:
+    - Queries PRAGMA index_list(validation_runs) checking unique == 1
+    - Queries PRAGMA index_info(name) verifying indexed columns are strictly ['patch_id']
+    Does NOT infer uniqueness from index names or substrings.
+    """
+    res = connection.execute(text("PRAGMA index_list(validation_runs)"))
+    rows = res.fetchall()
+    for row in rows:
+        # SQLite PRAGMA index_list returns: (seq, name, unique, origin, partial)
+        idx_name = row[1]
+        is_unique = bool(row[2])
+        if is_unique:
+            info_res = connection.execute(text(f"PRAGMA index_info('{idx_name}')"))
+            cols = [col_row[2] for col_row in info_res.fetchall()]
+            if cols == ["patch_id"]:
+                return True
+    return False
+
+
 def sync_upgrade_schema(connection) -> None:
     """
     Performs deterministic schema upgrades and enforces uniqueness invariants.
@@ -96,9 +117,7 @@ def sync_upgrade_schema(connection) -> None:
     if not res.fetchone():
         return
 
-    res = connection.execute(text("PRAGMA index_list(validation_runs)"))
-    indexes = [row[1] for row in res.fetchall()]
-    has_unique = any("unique" in idx.lower() or "patch_id" in idx.lower() for idx in indexes)
+    has_unique = check_validation_runs_unique_index(connection)
 
     if not has_unique:
         # Inspect existing records for duplicate patch IDs
@@ -142,6 +161,13 @@ def sync_upgrade_schema(connection) -> None:
             connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_validation_runs_patch_id ON validation_runs (patch_id)"))
         except Exception as e:
             raise RuntimeError(f"Database migration error: Failed to create unique index 'uq_validation_runs_patch_id': {e}") from e
+
+        # Post-migration verification against SQLite metadata
+        if not check_validation_runs_unique_index(connection):
+            raise RuntimeError(
+                "Database migration verification error: Unique index on validation_runs(patch_id) "
+                "could not be verified in SQLite index metadata after creation."
+            )
 
 
 async def init_db() -> None:

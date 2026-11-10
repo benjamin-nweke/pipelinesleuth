@@ -6,16 +6,19 @@ Includes durable, cross-process database-backed validation claims and concurrenc
 """
 import time
 import uuid
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from backend.app.database.session import AsyncSessionLocal
 from backend.app.models.investigation import Investigation
 from backend.app.models.project import Project
 from backend.app.models.patch import PatchProposal, ValidationRun
 from backend.app.tools.validate_patch import ValidatePatchTool
 from backend.app.core.config import settings
+from backend.app.core.auth import AuthenticatedPrincipal
 
 logger = logging.getLogger(__name__)
 
@@ -233,14 +236,14 @@ class PrivilegedValidationService:
         db: AsyncSession,
         investigation_id: str,
         patch_id: str,
-        timeout_seconds: int = 300,
-        force: bool = False
+        timeout_seconds: int = 300
     ) -> PatchProposal:
         """
         Safely recovers an abandoned validation claim using compare-and-swap (CAS) semantics.
         1. Verifies that the existing claim lease has genuinely expired.
-        2. Matches the exact claim token / claim timestamp in the atomic update predicate.
-        3. Refuses to reset if another worker has already reclaimed or modified the claim.
+        2. Matches the exact claim token and validation_lease_expires_at in the atomic update predicate.
+        3. Enforces validation_lease_expires_at <= :now directly in the SQL update condition.
+        4. Refuses to reset if another worker has already reclaimed, renewed, or modified the claim.
         """
         now = datetime.now(timezone.utc)
         patch_res = await db.execute(
@@ -255,35 +258,40 @@ class PrivilegedValidationService:
         if patch.status != "validating":
             raise ValueError(f"Patch '{patch_id}' is not in 'validating' state (current: '{patch.status}').")
 
-        # Check lease expiry
-        if not force:
-            if patch.validation_lease_expires_at:
-                exp = patch.validation_lease_expires_at
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-                if now < exp:
-                    remaining = (exp - now).total_seconds()
-                    raise ValueError(f"Validation claim is still active ({remaining:.1f}s remaining on lease). Cannot recover active claim.")
-            elif patch.validation_claimed_at:
-                claimed_at = patch.validation_claimed_at
-                if claimed_at.tzinfo is None:
-                    claimed_at = claimed_at.replace(tzinfo=timezone.utc)
-                elapsed = (now - claimed_at).total_seconds()
-                if elapsed < timeout_seconds:
-                    raise ValueError(f"Validation claim is still active ({elapsed:.1f}s elapsed < {timeout_seconds}s timeout).")
+        # Check lease expiry in-memory first for informative diagnostics
+        if patch.validation_lease_expires_at:
+            exp = patch.validation_lease_expires_at
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if now < exp:
+                remaining = (exp - now).total_seconds()
+                raise ValueError(f"Validation claim is still active ({remaining:.1f}s remaining on lease). Cannot recover active claim.")
+        elif patch.validation_claimed_at:
+            claimed_at = patch.validation_claimed_at
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+            elapsed = (now - claimed_at).total_seconds()
+            if elapsed < timeout_seconds:
+                raise ValueError(f"Validation claim is still active ({elapsed:.1f}s elapsed < {timeout_seconds}s timeout).")
 
         expected_token = patch.validation_claim_token
-        expected_claimed_at = patch.validation_claimed_at
+        expected_expires_at = patch.validation_lease_expires_at
 
-        # Atomic Compare-And-Swap (CAS) update
+        # Atomic Compare-And-Swap (CAS) update with database-level expiry enforcement
         where_conditions = [
             PatchProposal.id == patch_id,
+            PatchProposal.investigation_id == investigation_id,
             PatchProposal.status == "validating"
         ]
+        if expected_expires_at is not None:
+            where_conditions.append(PatchProposal.validation_lease_expires_at == expected_expires_at)
+            where_conditions.append(PatchProposal.validation_lease_expires_at <= now)
+        elif patch.validation_claimed_at is not None and timeout_seconds > 0:
+            where_conditions.append(PatchProposal.validation_claimed_at == patch.validation_claimed_at)
+            where_conditions.append(PatchProposal.validation_claimed_at <= now - timedelta(seconds=timeout_seconds))
+
         if expected_token:
             where_conditions.append(PatchProposal.validation_claim_token == expected_token)
-        elif expected_claimed_at:
-            where_conditions.append(PatchProposal.validation_claimed_at == expected_claimed_at)
 
         reset_stmt = (
             update(PatchProposal)
@@ -302,7 +310,7 @@ class PrivilegedValidationService:
         if res.rowcount == 0:
             raise ValueError(
                 f"Concurrency violation: Stale recovery attempt rejected. "
-                f"Patch '{patch_id}' claim was already reclaimed or updated by another worker."
+                f"Patch '{patch_id}' claim was already reclaimed, renewed, or updated by another worker, or is still active."
             )
 
         await db.refresh(patch)
@@ -321,14 +329,18 @@ class PrivilegedValidationService:
         investigation_id: str,
         patch_id: str,
         test_command: Optional[List[str]] = None,
-        worker_id: str = "worker-default"
+        worker_id: str = "worker-default",
+        lease_seconds: int = 300,
+        renewal_interval: Optional[float] = None
     ) -> ValidationRun:
         """
         Executes an isolated validation run for an approved patch.
         1. Atomically claims patch in database ('approved' -> 'validating').
-        2. Executes candidate patch in isolated copy.
-        3. Records accurate final status: 'validated' on test success, 'validation_failed' on test failure.
-        4. Persists unique ValidationRun record.
+        2. Spawns an async heartbeat renewal task that periodically extends the lease.
+        3. Executes candidate patch in isolated copy.
+        4. Detects loss of claim ownership and rejects commit if ownership was lost.
+        5. Commits final status atomically using CAS validation token match.
+        6. Reliably cancels and cleans up heartbeat task in finally block.
         """
         start_time = time.time()
 
@@ -337,15 +349,61 @@ class PrivilegedValidationService:
             db=db,
             investigation_id=investigation_id,
             patch_id=patch_id,
-            worker_id=worker_id
+            worker_id=worker_id,
+            lease_seconds=lease_seconds
         )
+        claim_token = patch.validation_claim_token
 
-        # 2. Retrieve project workspace directory
+        # 2. Spawn async heartbeat renewal loop
+        stop_heartbeat = asyncio.Event()
+        ownership_lost = False
+        heartbeat_error: Optional[str] = None
+        interval = renewal_interval or min(10.0, max(1.0, lease_seconds / 3.0))
+
+        async def _heartbeat_loop():
+            nonlocal ownership_lost, heartbeat_error
+            try:
+                while not stop_heartbeat.is_set():
+                    try:
+                        await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+                    if stop_heartbeat.is_set():
+                        break
+
+                    try:
+                        async with AsyncSessionLocal() as hb_session:
+                            await self.renew_validation_lease(
+                                db=hb_session,
+                                investigation_id=investigation_id,
+                                patch_id=patch_id,
+                                claim_token=claim_token,
+                                extend_seconds=lease_seconds
+                            )
+                            logger.debug(f"Heartbeat renewed lease for patch {patch_id}")
+                    except Exception as renew_err:
+                        logger.warning(f"Heartbeat renewal failed for patch {patch_id}: {renew_err}")
+                        ownership_lost = True
+                        heartbeat_error = str(renew_err)
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
+        # 3. Retrieve project workspace directory
         inv_res = await db.execute(
             select(Investigation).where(Investigation.id == investigation_id)
         )
         inv = inv_res.scalar_one_or_none()
         if not inv:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
             raise ValueError(f"Investigation '{investigation_id}' not found.")
 
         proj_res = await db.execute(
@@ -353,6 +411,12 @@ class PrivilegedValidationService:
         )
         project = proj_res.scalar_one_or_none()
         if not project:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
             raise ValueError(f"Project for investigation '{investigation_id}' not found.")
 
         project_dir = str(settings.UPLOADS_DIR / project.id)
@@ -366,7 +430,7 @@ class PrivilegedValidationService:
             details=f"Executing isolated candidate patch validation for: {patch.target_file}"
         ))
 
-        # 3. Execute isolated candidate patch validation using ValidatePatchTool
+        # 4. Execute isolated candidate patch validation using ValidatePatchTool
         val_tool = ValidatePatchTool()
         val_args = {
             "patch_id": patch.id,
@@ -381,6 +445,12 @@ class PrivilegedValidationService:
                 arguments=val_args
             )
 
+            # Check if claim ownership was lost during tool execution
+            if ownership_lost:
+                raise RuntimeError(
+                    f"Security violation: Validation claim ownership for patch '{patch_id}' was lost during execution: {heartbeat_error}"
+                )
+
             res_data = tool_result.data or {}
             stdout = res_data.get("stdout", "")
             stderr = res_data.get("stderr", "") or (tool_result.error or "")
@@ -388,7 +458,7 @@ class PrivilegedValidationService:
             val_status = "passed" if (tool_result.success and exit_code == 0) else "failed"
             execution_time_ms = int((time.time() - start_time) * 1000)
 
-            # 4. Persist ValidationRun record bound to the patch and approver
+            # 5. Persist ValidationRun record bound to the patch and approver
             validation_run = ValidationRun(
                 investigation_id=investigation_id,
                 patch_id=patch.id,
@@ -404,7 +474,30 @@ class PrivilegedValidationService:
             )
             db.add(validation_run)
 
-            # 5. Accurate status update reflecting validation outcome
+            # 6. Atomic CAS status update reflecting validation outcome with claim_token guard
+            final_patch_status = "validated" if val_status == "passed" else "validation_failed"
+            commit_stmt = (
+                update(PatchProposal)
+                .where(
+                    PatchProposal.id == patch.id,
+                    PatchProposal.investigation_id == investigation_id,
+                    PatchProposal.status == "validating",
+                    PatchProposal.validation_claim_token == claim_token
+                )
+                .values(
+                    status=final_patch_status,
+                    validation_lease_expires_at=None,
+                    validation_claim_token=None,
+                    validation_claimed_by=None
+                )
+            )
+            commit_res = await db.execute(commit_stmt)
+            if commit_res.rowcount == 0:
+                raise RuntimeError(
+                    f"Security violation: Failed to commit validation outcome for patch '{patch.id}'. "
+                    f"Claim ownership was lost, expired, or superseded during execution."
+                )
+
             if val_status == "passed":
                 patch.status = "validated"
                 if inv:
@@ -431,16 +524,39 @@ class PrivilegedValidationService:
 
         except Exception as e:
             logger.error(f"Execution error during validation of patch {patch_id}: {e}", exc_info=True)
-            # Update patch to validation_failed so it does not remain stuck in 'validating'
-            try:
-                patch.status = "validation_failed"
-                if inv:
-                    inv.status = "patch_validation_failed"
-                    inv.stage = "report_generation"
-                await db.commit()
-            except Exception as db_err:
-                logger.error(f"Failed to record validation failure state: {db_err}")
+            if not ownership_lost:
+                try:
+                    fail_stmt = (
+                        update(PatchProposal)
+                        .where(
+                            PatchProposal.id == patch.id,
+                            PatchProposal.investigation_id == investigation_id,
+                            PatchProposal.status == "validating",
+                            PatchProposal.validation_claim_token == claim_token
+                        )
+                        .values(
+                            status="validation_failed",
+                            validation_lease_expires_at=None,
+                            validation_claim_token=None,
+                            validation_claimed_by=None
+                        )
+                    )
+                    await db.execute(fail_stmt)
+                    if inv:
+                        inv.status = "patch_validation_failed"
+                        inv.stage = "report_generation"
+                    await db.commit()
+                except Exception as db_err:
+                    logger.error(f"Failed to record validation failure state: {db_err}")
             raise
+
+        finally:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
 
 privileged_validation_service = PrivilegedValidationService()
