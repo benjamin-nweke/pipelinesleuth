@@ -323,6 +323,55 @@ class PrivilegedValidationService:
         ))
         return patch
 
+    async def force_recover_validation_claim(
+        self,
+        db: AsyncSession,
+        investigation_id: str,
+        patch_id: str,
+        operator: AuthenticatedPrincipal
+    ) -> PatchProposal:
+        """
+        Explicit administrative forced recovery operation for emergency intervention.
+        Requires an authenticated operator principal with administrative authority.
+        Never called by standard automated recovery or startup recovery.
+        """
+        patch_res = await db.execute(
+            select(PatchProposal).where(
+                PatchProposal.id == patch_id,
+                PatchProposal.investigation_id == investigation_id
+            )
+        )
+        patch = patch_res.scalar_one_or_none()
+        if not patch:
+            raise ValueError(f"Patch '{patch_id}' not found.")
+
+        reset_stmt = (
+            update(PatchProposal)
+            .where(
+                PatchProposal.id == patch_id,
+                PatchProposal.investigation_id == investigation_id
+            )
+            .values(
+                status="approved",
+                validation_claimed_at=None,
+                validation_lease_expires_at=None,
+                validation_claimed_by=None,
+                validation_claim_token=None
+            )
+        )
+        await db.execute(reset_stmt)
+        await db.commit()
+        await db.refresh(patch)
+
+        self._record_audit(PrivilegedValidationAuditEntry(
+            investigation_id=investigation_id,
+            patch_id=patch_id,
+            authorized_by=operator.principal_id,
+            status="admin_force_recovered",
+            details=f"Emergency administrative claim recovery executed by operator '{operator.principal_id}'."
+        ))
+        return patch
+
     async def execute_approved_patch_validation(
         self,
         db: AsyncSession,

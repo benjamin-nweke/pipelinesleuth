@@ -93,10 +93,10 @@ Create or update `.env` in the project root with your generated credential:
 ```env
 # Operator Authorization Credentials (Required for Patch Approval/Rejection)
 # Replace placeholder with your generated 32-byte cryptographically secure random token:
-OPERATOR_API_KEY=<GENERATE_A_SECURE_RANDOM_TOKEN_HERE>
+OPERATOR_API_KEY=REPLACE_WITH_A_RANDOM_SECRET
 
 # Optional: Multi-Operator Credential Configuration (JSON mapping with canonical principal_id)
-# OPERATOR_TOKENS_JSON='{"<GENERATE_A_SECURE_RANDOM_TOKEN_HERE>": {"principal_id": "operator_admin", "role": "operator", "scopes": ["patch:approve", "patch:reject"]}}'
+# OPERATOR_TOKENS_JSON='{"REPLACE_WITH_A_RANDOM_SECRET": {"principal_id": "operator_admin", "role": "operator", "scopes": ["patch:approve", "patch:reject"]}}'
 ```
 
 - **Validation at Startup**: Operator credentials are strictly validated during application startup. Malformed JSON, tokens shorter than 16 characters, missing or blank canonical `principal_id`, literal placeholder strings, and tokens on the prohibited blocklist cause immediate startup failure.

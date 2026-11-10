@@ -1085,3 +1085,238 @@ async def test_execute_approved_patch_validation_heartbeat_renewal_and_ownership
                 renewal_interval=0.1
             )
 
+
+# ============================================================================
+# 9. EXPLICIT AUDIT REGRESSION TESTS FOR REQUIREMENTS 2, 3, 4, 5
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_two_recovery_workers_attempting_recovery_concurrently(db_session: AsyncSession):
+    """Two recovery workers attempting CAS recovery concurrently: exactly one succeeds."""
+    proj = Project(name="Concurrent Recovery Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Concurrent recovery")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    expired_time = now - timedelta(seconds=120)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="old",
+        proposed_code="new",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="lead_op",
+        approved_at=expired_time,
+        validation_claimed_at=expired_time,
+        validation_lease_expires_at=expired_time,
+        validation_claimed_by="worker_dead",
+        validation_claim_token="claim_token_to_recover"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Worker 1 recovers successfully
+    rec1 = await privileged_validation_service.recover_abandoned_validation(
+        db=db_session,
+        investigation_id=inv.id,
+        patch_id=patch.id
+    )
+    assert rec1.status == "approved"
+    assert rec1.validation_claim_token is None
+
+    # Worker 2 attempting recovery on already recovered patch raises ValueError
+    with pytest.raises(ValueError, match="is not in 'validating' state"):
+        await privileged_validation_service.recover_abandoned_validation(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_worker_encountering_stale_claim_token(db_session: AsyncSession):
+    """A stale claim token that does not match the active claim cannot be recovered."""
+    proj = Project(name="Stale Token Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Stale token")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    expired_time = now - timedelta(seconds=60)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="old",
+        proposed_code="new",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="lead_op",
+        approved_at=expired_time,
+        validation_claimed_at=expired_time,
+        validation_lease_expires_at=expired_time,
+        validation_claimed_by="worker_1",
+        validation_claim_token="claim_token_A"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Worker B claims with new token before worker A's recovery CAS executes
+    patch.validation_claim_token = "claim_token_B"
+    patch.validation_lease_expires_at = now + timedelta(seconds=300)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="Validation claim is still active"):
+        await privileged_validation_service.recover_abandoned_validation(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_encountering_valid_renewed_claim(db_session: AsyncSession):
+    """Startup recovery must NOT reset an actively validating patch whose lease is valid/renewed."""
+    proj = Project(name="Startup Renewed Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Startup test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="lead_op",
+        approved_at=now,
+        validation_claimed_at=now,
+        validation_lease_expires_at=now + timedelta(seconds=600),
+        validation_claimed_by="active_worker",
+        validation_claim_token="claim_active_token"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Run startup recovery
+    dispatched = await investigation_service.resume_pending_validations_on_startup()
+    assert patch.id not in dispatched
+
+    # Verify patch was NOT reset
+    await db_session.refresh(patch)
+    assert patch.status == "validating"
+    assert patch.validation_claim_token == "claim_active_token"
+
+
+@pytest.mark.asyncio
+async def test_validation_execution_successful_periodic_lease_renewal(db_session: AsyncSession):
+    """Validation execution periodically renews its lease via the background heartbeat task."""
+    proj = Project(name="Renewal Execution Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Renewal execution")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="def foo(): pass",
+        proposed_code="def foo(): return 1",
+        unified_diff="diff",
+        explanation="expl",
+        status="approved",
+        approved_by="lead_op",
+        approved_at=now
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    from unittest.mock import AsyncMock, patch as mock_patch
+    from backend.app.tools.base import ToolResult
+
+    mock_tool = AsyncMock()
+    async def delayed_success(*args, **kwargs):
+        # Allow heartbeat loop to execute at least once
+        await asyncio.sleep(0.25)
+        return ToolResult(success=True, summary="Tests passed", data={"stdout": "ok", "exit_code": 0})
+
+    mock_tool.execute = delayed_success
+
+    with mock_patch("backend.app.services.validation_service.ValidatePatchTool", return_value=mock_tool):
+        val_run = await privileged_validation_service.execute_approved_patch_validation(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            lease_seconds=2,
+            renewal_interval=0.1
+        )
+        assert val_run.status == "passed"
+        assert val_run.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_evidence_path_missing_workspace_fails_closed_for_absolute_paths():
+    """If workspace_dir is missing/None, untrusted absolute paths fail closed."""
+    files = [ProjectFile(id="f1", project_id="p1", relative_path="pipeline.py", file_type="code", size_bytes=100, storage_path="/tmp/f1")]
+    ev_abs = AgentEvidenceInput(
+        source_file="/etc/shadow",
+        evidence_type="code_ast",
+        observation="Secret file access"
+    )
+    # Without workspace_dir, absolute path must be unverified
+    status, is_inf, _ = verify_evidence_against_telemetry(ev_abs, files, [], workspace_dir=None)
+    assert status == "unverified"
+    assert is_inf is False
+
+    # Also resolve_frame_to_project_relative fails closed for arbitrary absolute paths without workspace_dir
+    res = resolve_frame_to_project_relative("/var/log/arbitrary.py", {"arbitrary.py"}, workspace_dir=None)
+    assert res is None
+
+
+def test_sqlite_metadata_distinguishes_index_configurations():
+    """Confirms SQLite metadata PRAGMA checks accurately distinguish index properties."""
+    import sqlite3
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db_path = f.name
+
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE validation_runs (id VARCHAR(36) PRIMARY KEY, patch_id VARCHAR(36), status VARCHAR(50))")
+
+    class RealConn:
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if params:
+                return con.execute(sql, params)
+            return con.execute(sql)
+
+    wrapper = RealConn()
+
+    # 1. Non-unique index
+    con.execute("CREATE INDEX uq_validation_runs_patch_id ON validation_runs (patch_id)")
+    assert check_validation_runs_unique_index(wrapper) is False
+    con.execute("DROP INDEX uq_validation_runs_patch_id")
+
+    # 2. Correct unique index
+    con.execute("CREATE UNIQUE INDEX uq_validation_runs_patch_id ON validation_runs (patch_id)")
+    assert check_validation_runs_unique_index(wrapper) is True
+    con.close()
+
+
