@@ -2139,4 +2139,831 @@ def test_evidence_mixed_claims_downgraded_to_inference():
     assert matched_id == "te_ast_mixed"
 
 
+# ============================================================================
+# 10. FIELD- AND RELATIONSHIP-PRESERVING EVIDENCE VERIFICATION TESTS
+# ============================================================================
+
+def test_evidence_column_level_null_count_separation():
+    """
+    Column-level claims must verify strictly against the named column's profile.
+    A null count belonging to `amount` (2) cannot verify a claim about `customer_id` (0),
+    nor can `null_percentage` masquerade as `null_count`.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="data/orders.csv", file_type="data", size_bytes=100, storage_path="/tmp/f1")
+    ]
+    te_prof = ToolExecution(
+        id="te-col-sep",
+        investigation_id="inv-sep",
+        tool_name="profile_dataset",
+        status="success",
+        output_result={
+            "dataset_path": "data/orders.csv",
+            "total_rows": 10,
+            "total_columns": 2,
+            "duplicate_rows": 0,
+            "column_profiles": {
+                "customer_id": {"dtype": "int64", "null_count": 0, "null_percentage": 0.0, "distinct_count": 10},
+                "amount": {"dtype": "float64", "null_count": 2, "null_percentage": 20.0, "distinct_count": 8},
+            },
+            "anomalies": [
+                {"column": "amount", "type": "null_values_detected", "null_count": 2, "null_percentage": 20.0}
+            ],
+        },
+    )
+
+    # 1. Cross-column false claim with column_name=None
+    ev_false_none = AgentEvidenceInput(
+        source_file="data/orders.csv",
+        evidence_type="dataset_anomaly",
+        column_name=None,
+        tool_execution_id="te-col-sep",
+        observation="customer_id has 2 null values",
+    )
+    s1, is_inf1, _ = verify_evidence_against_telemetry(ev_false_none, files, [te_prof], investigation_id="inv-sep")
+    assert s1 == "unverified"
+    assert is_inf1 is False
+
+    # 2. Cross-column false claim while spoofing column_name="amount"
+    ev_false_spoof = AgentEvidenceInput(
+        source_file="data/orders.csv",
+        evidence_type="dataset_anomaly",
+        column_name="amount",
+        tool_execution_id="te-col-sep",
+        observation="customer_id has 2 null values",
+    )
+    s2, _, _ = verify_evidence_against_telemetry(ev_false_spoof, files, [te_prof], investigation_id="inv-sep")
+    assert s2 == "unverified"
+
+    # 3. Reverse spoofing: true observation about amount but structured column_name="customer_id"
+    ev_rev_spoof = AgentEvidenceInput(
+        source_file="data/orders.csv",
+        evidence_type="dataset_anomaly",
+        column_name="customer_id",
+        tool_execution_id="te-col-sep",
+        observation="amount has 2 null values",
+    )
+    s3, _, _ = verify_evidence_against_telemetry(ev_rev_spoof, files, [te_prof], investigation_id="inv-sep")
+    assert s3 == "unverified"
+
+    # 4. Confusing percentage (20.0) as raw null count ("amount has 20 null values")
+    ev_pct_as_count = AgentEvidenceInput(
+        source_file="data/orders.csv",
+        evidence_type="dataset_anomaly",
+        column_name="amount",
+        tool_execution_id="te-col-sep",
+        observation="amount has 20 null values",
+    )
+    s4, _, _ = verify_evidence_against_telemetry(ev_pct_as_count, files, [te_prof], investigation_id="inv-sep")
+    assert s4 == "unverified"
+
+    # 5. Legitimate multi-column observation Verify: customer_id has 0 nulls while amount has 2 nulls
+    ev_multi_valid = AgentEvidenceInput(
+        source_file="data/orders.csv",
+        evidence_type="dataset_anomaly",
+        tool_execution_id="te-col-sep",
+        observation="customer_id has 0 nulls while amount has 2 nulls",
+    )
+    s5, is_inf5, tid5 = verify_evidence_against_telemetry(ev_multi_valid, files, [te_prof], investigation_id="inv-sep")
+    assert s5 == "verified"
+    assert is_inf5 is False
+    assert tid5 == "te-col-sep"
+
+    # 6. Multi-column observation where one clause is true and second clause is false -> unverified
+    ev_multi_mixed_false = AgentEvidenceInput(
+        source_file="data/orders.csv",
+        evidence_type="dataset_anomaly",
+        tool_execution_id="te-col-sep",
+        observation="amount has 2 nulls while customer_id has 2 nulls",
+    )
+    s6, _, _ = verify_evidence_against_telemetry(ev_multi_mixed_false, files, [te_prof], investigation_id="inv-sep")
+    assert s6 == "unverified"
+
+
+def test_evidence_unrelated_numerical_telemetry_cannot_support_claim():
+    """
+    Unrelated numbers elsewhere in telemetry (e.g. total_rows=100, duplicate_rows=5, another column's null_count,
+    or max value) must never verify an assertion about a different metric or entity.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="data/orders.csv", file_type="data", size_bytes=100, storage_path="/tmp/f1")
+    ]
+    te_prof = ToolExecution(
+        id="te-num-sep",
+        investigation_id="inv-num",
+        tool_name="profile_dataset",
+        status="success",
+        output_result={
+            "dataset_path": "data/orders.csv",
+            "total_rows": 100,
+            "total_columns": 2,
+            "duplicate_rows": 5,
+            "column_profiles": {
+                "customer_id": {"dtype": "int64", "null_count": 0, "null_percentage": 0.0, "distinct_count": 98},
+                "amount": {
+                    "dtype": "float64",
+                    "null_count": 1,
+                    "null_percentage": 1.0,
+                    "distinct_count": 95,
+                    "numeric_stats": {"min": 10.0, "max": 200.0, "mean": 50.0, "median": 45.0, "std": 25.0},
+                },
+            },
+            "anomalies": [{"column": "amount", "type": "null_values_detected", "null_count": 1, "null_percentage": 1.0}],
+        },
+    )
+
+    # 1. total_rows=100 cannot verify "customer_id has 100 null values"
+    s1, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_anomaly",
+            column_name="customer_id",
+            tool_execution_id="te-num-sep",
+            observation="customer_id has 100 null values",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s1 == "unverified"
+
+    # 2. total_rows=100 cannot verify "amount has 100 null values" even though amount has 1 null
+    s2, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_anomaly",
+            column_name="amount",
+            tool_execution_id="te-num-sep",
+            observation="amount has 100 null values",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s2 == "unverified"
+
+    # 3. duplicate_rows=5 cannot verify "customer_id has 5 null values"
+    s3, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_anomaly",
+            column_name="customer_id",
+            tool_execution_id="te-num-sep",
+            observation="customer_id has 5 null values",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s3 == "unverified"
+
+    # 4. total_rows=100 cannot verify "amount has mean 100" when amount mean=50.0
+    s4, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_anomaly",
+            column_name="amount",
+            tool_execution_id="te-num-sep",
+            observation="amount has mean 100",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s4 == "unverified"
+
+    # 5. Swapped min/max values in same clause must be rejected
+    s5, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_anomaly",
+            column_name="amount",
+            tool_execution_id="te-num-sep",
+            observation="amount has min 200.0 and max 10.0",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s5 == "unverified"
+
+    # 6. Exact field match on distinct_count=98 verifies cleanly
+    s6, is_inf6, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_profile",
+            column_name="customer_id",
+            tool_execution_id="te-num-sep",
+            observation="customer_id has 98 distinct values",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s6 == "verified"
+    assert is_inf6 is False
+
+    # 7. Valid compound numeric_stats observation without column_name verifies cleanly
+    s7, is_inf7, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_profile",
+            tool_execution_id="te-num-sep",
+            observation="amount has min 10.0 and max 200.0",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s7 == "verified"
+    assert is_inf7 is False
+
+    # 8. Shared multi-column predicate fails closed when either column violates the claim
+    s8, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="dataset_anomaly",
+            tool_execution_id="te-num-sep",
+            observation="customer_id and amount have 1 null value",
+        ),
+        files,
+        [te_prof],
+        investigation_id="inv-num",
+    )
+    assert s8 == "unverified"
+
+
+def test_evidence_traceback_supports_exception_not_causal_claim():
+    """
+    Real analyze_logs traceback supports exact file, line, and exception fact,
+    while any causal explanation or mismatched exception detail cannot be marked verified.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="src/pipeline.py", file_type="code", size_bytes=100, storage_path="/tmp/f1")
+    ]
+    te_log = ToolExecution(
+        id="te-tb-01",
+        investigation_id="inv-tb",
+        tool_name="analyze_logs",
+        status="success",
+        output_result={
+            "total_lines": 25,
+            "stages_detected": ["transform"],
+            "preceding_warnings": [],
+            "tracebacks": [
+                {
+                    "start_line": 10,
+                    "frames": [
+                        {
+                            "file": "/app/src/pipeline.py",
+                            "line": 30,
+                            "function": "aggregate_sales",
+                            "code_line": "return df['customer_id'].sum()",
+                        }
+                    ],
+                    "exception_type": "KeyError",
+                    "exception_message": "'customer_id'",
+                }
+            ],
+            "fatal_error": {
+                "exception_type": "KeyError",
+                "exception_message": "'customer_id'",
+                "last_frame": {
+                    "file": "/app/src/pipeline.py",
+                    "line": 30,
+                    "function": "aggregate_sales",
+                    "code_line": "return df['customer_id'].sum()",
+                },
+            },
+        },
+    )
+
+    # Exact exception claim -> verified
+    s_ok, is_inf_ok, tid_ok = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="src/pipeline.py",
+            evidence_type="log_stacktrace",
+            line_number=30,
+            column_name="customer_id",
+            tool_execution_id="te-tb-01",
+            observation="KeyError for customer_id in aggregate_sales at line 30",
+        ),
+        files,
+        [te_log],
+        investigation_id="inv-tb",
+    )
+    assert s_ok == "verified"
+    assert is_inf_ok is False
+    assert tid_ok == "te-tb-01"
+
+    # Causal explanation attached to valid traceback -> inference
+    s_causal, is_inf_causal, tid_causal = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="src/pipeline.py",
+            evidence_type="log_stacktrace",
+            line_number=30,
+            tool_execution_id="te-tb-01",
+            observation="KeyError on customer_id at line 30 caused by upstream schema migration",
+        ),
+        files,
+        [te_log],
+        investigation_id="inv-tb",
+    )
+    assert s_causal == "inference"
+    assert is_inf_causal is True
+    assert tid_causal == "te-tb-01"
+
+    # Uncorroborated column_name on KeyError traceback -> unverified
+    s_wrong_col, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="src/pipeline.py",
+            evidence_type="log_stacktrace",
+            line_number=30,
+            column_name="amount",
+            tool_execution_id="te-tb-01",
+            observation="KeyError on amount at line 30",
+        ),
+        files,
+        [te_log],
+        investigation_id="inv-tb",
+    )
+    assert s_wrong_col == "unverified"
+
+
+def test_evidence_dependency_reversed_direction_rejected():
+    """
+    Dependency verification must preserve edge direction across both mock fields
+    and real trace_dependencies outputs (`stages`, `edges`, `target_analysis`).
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="pipeline.py", file_type="code", size_bytes=100, storage_path="/tmp/f1"),
+        ProjectFile(id="f2", project_id="p2", relative_path="database.py", file_type="code", size_bytes=100, storage_path="/tmp/f2"),
+        ProjectFile(id="f3", project_id="p3", relative_path="data/output.csv", file_type="data", size_bytes=100, storage_path="/tmp/f3"),
+    ]
+
+    # Case A: Real trace_dependencies schema (edges use 'from' -> 'to' dataflow direction)
+    te_real_dep = ToolExecution(
+        id="te-dep-real",
+        investigation_id="inv-dep",
+        tool_name="trace_dependencies",
+        status="success",
+        output_result={
+            "stages": {
+                "pipeline.py": {"inputs": ["database.py"], "outputs": ["data/output.csv"], "imports": ["pandas"]},
+                "database.py": {"inputs": [], "outputs": ["data/raw.csv"], "imports": ["sqlite3"]},
+            },
+            "nodes": [
+                {"id": "database.py", "type": "stage", "label": "database.py"},
+                {"id": "pipeline.py", "type": "stage", "label": "pipeline.py"},
+                {"id": "data/output.csv", "type": "dataset", "label": "data/output.csv"},
+            ],
+            "edges": [
+                {"from": "database.py", "to": "pipeline.py", "relationship": "reads"},
+                {"from": "pipeline.py", "to": "data/output.csv", "relationship": "writes"},
+            ],
+            "target_analysis": {
+                "target": "pipeline.py",
+                "upstream": ["database.py"],
+                "downstream": ["data/output.csv"],
+            },
+        },
+    )
+
+    # Correct direction: pipeline.py depends on database.py -> verified
+    s_ok, is_inf_ok, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            tool_execution_id="te-dep-real",
+            observation="pipeline.py depends on database.py",
+        ),
+        files,
+        [te_real_dep],
+        investigation_id="inv-dep",
+    )
+    assert s_ok == "verified"
+    assert is_inf_ok is False
+
+    # Reversed direction: database.py depends on pipeline.py -> unverified
+    s_rev1, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            tool_execution_id="te-dep-real",
+            observation="database.py depends on pipeline.py",
+        ),
+        files,
+        [te_real_dep],
+        investigation_id="inv-dep",
+    )
+    assert s_rev1 == "unverified"
+
+    # Reversed phrase: pipeline.py is an upstream dependency of database.py -> unverified
+    s_rev2, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            tool_execution_id="te-dep-real",
+            observation="pipeline.py is an upstream dependency of database.py",
+        ),
+        files,
+        [te_dep := te_real_dep],
+        investigation_id="inv-dep",
+    )
+    assert s_rev2 == "unverified"
+
+    # Valid reverse/downstream claim: pipeline.py is used by data/output.csv -> verified
+    s_down_ok, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            tool_execution_id="te-dep-real",
+            observation="pipeline.py is used by data/output.csv",
+        ),
+        files,
+        [te_dep],
+        investigation_id="inv-dep",
+    )
+    assert s_down_ok == "verified"
+
+    # Case B: Mock schema with dependencies=['database.py']
+    te_mock_dep = ToolExecution(
+        id="te-dep-mock",
+        investigation_id="inv-dep",
+        tool_name="trace_dependencies",
+        status="success",
+        output_result={"dependencies": ["database.py"], "reverse_dependencies": []},
+    )
+    s_rev_mock, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            tool_execution_id="te-dep-mock",
+            observation="database.py depends on pipeline.py",
+        ),
+        files,
+        [te_mock_dep],
+        investigation_id="inv-dep",
+    )
+    assert s_rev_mock == "unverified"
+
+
+def test_evidence_ast_confirms_existence_not_runtime_behavior():
+    """
+    AST inspection establishes static syntax/location only and must never mark
+    runtime security, validation, or behavioral claims as verified.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="auth/middleware.py", file_type="code", size_bytes=100, storage_path="/tmp/f1")
+    ]
+    te_ast = ToolExecution(
+        id="te-ast-sec",
+        investigation_id="inv-ast",
+        tool_name="inspect_code",
+        status="success",
+        output_result={
+            "file": "auth/middleware.py",
+            "total_lines": 40,
+            "functions": [{"name": "validate_user", "line_start": 20, "line_end": 35, "arguments": ["token", "secret"]}],
+            "imports": ["jwt"],
+        },
+    )
+
+    # Syntactic definition matches -> verified
+    s_syn, is_inf_syn, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="auth/middleware.py",
+            evidence_type="code_ast",
+            line_number=20,
+            tool_execution_id="te-ast-sec",
+            observation="Function validate_user is defined at line 20 with parameters token and secret",
+        ),
+        files,
+        [te_ast],
+        investigation_id="inv-ast",
+    )
+    assert s_syn == "verified"
+    assert is_inf_syn is False
+
+    # Runtime behavioral claim -> inference (never verified)
+    s_beh, is_inf_beh, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="auth/middleware.py",
+            evidence_type="code_ast",
+            line_number=20,
+            tool_execution_id="te-ast-sec",
+            observation="validate_user function at line 20 validates JWT signatures and decrypts auth tokens",
+        ),
+        files,
+        [te_ast],
+        investigation_id="inv-ast",
+    )
+    assert s_beh == "inference"
+    assert is_inf_beh is True
+
+
+def test_evidence_supported_number_with_unsupported_causal_claim():
+    """
+    An accurate numeric fact combined with an unsupported causal explanation
+    must be downgraded to `inference`, never marked `verified`.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="data/payments.csv", file_type="data", size_bytes=100, storage_path="/tmp/f1")
+    ]
+    te_prof = ToolExecution(
+        id="te-prof-causal",
+        investigation_id="inv-c",
+        tool_name="profile_dataset",
+        status="success",
+        output_result={
+            "dataset_path": "data/payments.csv",
+            "total_rows": 50,
+            "duplicate_rows": 0,
+            "column_profiles": {
+                "amount": {"dtype": "float64", "null_count": 2, "null_percentage": 4.0, "distinct_count": 48}
+            },
+            "anomalies": [{"column": "amount", "type": "null_values_detected", "null_count": 2, "null_percentage": 4.0}],
+        },
+    )
+    ev = AgentEvidenceInput(
+        source_file="data/payments.csv",
+        evidence_type="dataset_anomaly",
+        column_name="amount",
+        tool_execution_id="te-prof-causal",
+        observation="amount column has 2 null values due to network partition during upstream ingestion",
+    )
+    status, is_inf, matched_id = verify_evidence_against_telemetry(ev, files, [te_prof], investigation_id="inv-c")
+    assert status == "inference"
+    assert is_inf is True
+    assert matched_id == "te-prof-causal"
+
+
+def test_evidence_missing_or_incomplete_telemetry_not_verified():
+    """
+    Missing or incomplete telemetry across every tool type fails closed
+    and must never return `verified`.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="pipeline.py", file_type="code", size_bytes=100, storage_path="/tmp/f1"),
+        ProjectFile(id="f2", project_id="p2", relative_path="data.csv", file_type="data", size_bytes=100, storage_path="/tmp/f2"),
+    ]
+
+    # 1. Incomplete profile_dataset missing null_count must NOT default null_count to 0
+    te_incomplete_prof = ToolExecution(
+        id="te-inc-prof",
+        investigation_id="inv-inc",
+        tool_name="profile_dataset",
+        status="success",
+        output_result={
+            "dataset_path": "data.csv",
+            "column_profiles": {"customer_id": {"dtype": "int64"}},
+            "anomalies": [],
+        },
+    )
+    s1, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data.csv",
+            evidence_type="dataset_profile",
+            column_name="customer_id",
+            tool_execution_id="te-inc-prof",
+            observation="customer_id has 0 null values",
+        ),
+        files,
+        [te_incomplete_prof],
+        investigation_id="inv-inc",
+    )
+    assert s1 != "verified"
+    assert s1 == "unverified"
+
+    # 2. analyze_logs with no tracebacks or fatal_error
+    te_empty_log = ToolExecution(
+        id="te-inc-log",
+        investigation_id="inv-inc",
+        tool_name="analyze_logs",
+        status="success",
+        output_result={"total_lines": 100, "tracebacks": [], "fatal_error": None},
+    )
+    s2, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="log_stacktrace",
+            tool_execution_id="te-inc-log",
+            observation="KeyError on customer_id at line 20",
+        ),
+        files,
+        [te_empty_log],
+        investigation_id="inv-inc",
+    )
+    assert s2 == "unverified"
+
+    # 3. inspect_code with empty functions/imports
+    te_empty_ast = ToolExecution(
+        id="te-inc-ast",
+        investigation_id="inv-inc",
+        tool_name="inspect_code",
+        status="success",
+        output_result={"file": "pipeline.py", "functions": [], "imports": []},
+    )
+    s3, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="code_ast",
+            tool_execution_id="te-inc-ast",
+            observation="Function run is defined at line 1",
+        ),
+        files,
+        [te_empty_ast],
+        investigation_id="inv-inc",
+    )
+    assert s3 == "unverified"
+
+    # 4. trace_dependencies with empty graph
+    te_empty_dep = ToolExecution(
+        id="te-inc-dep",
+        investigation_id="inv-inc",
+        tool_name="trace_dependencies",
+        status="success",
+        output_result={"stages": {}, "nodes": [], "edges": [], "target_analysis": None},
+    )
+    s4, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            tool_execution_id="te-inc-dep",
+            observation="pipeline.py depends on database.py",
+        ),
+        files,
+        [te_empty_dep],
+        investigation_id="inv-inc",
+    )
+    assert s4 == "unverified"
+
+    # 5. inspect_schema with empty diff/target
+    te_empty_schema = ToolExecution(
+        id="te-inc-sch",
+        investigation_id="inv-inc",
+        tool_name="inspect_schema",
+        status="success",
+        output_result={"target_schema": {}, "differences": {}},
+    )
+    s5, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data.csv",
+            evidence_type="schema_diff",
+            column_name="customer_id",
+            tool_execution_id="te-inc-sch",
+            observation="customer_id column is missing from schema",
+        ),
+        files,
+        [te_empty_schema],
+        investigation_id="inv-inc",
+    )
+    assert s5 == "unverified"
+
+
+@pytest.mark.asyncio
+async def test_evidence_real_tool_schemas_positive_verification(tmp_path: Path):
+    """
+    Executes the actual 5 diagnostic tools against real project fixtures and verifies
+    that accurate field-bound observations pass verification while distorted claims fail.
+    """
+    from backend.app.tools.analyze_logs import AnalyzeLogsTool
+    from backend.app.tools.profile_dataset import ProfileDatasetTool
+    from backend.app.tools.inspect_code import InspectCodeTool
+    from backend.app.tools.trace_dependencies import TraceDependenciesTool
+    from backend.app.tools.inspect_schema import InspectSchemaTool
+
+    (tmp_path / "pipeline.py").write_text(
+        "import pandas as pd\n"
+        "def clean_orders(df):\n"
+        "    df = pd.read_csv('orders.csv')\n"
+        "    return df['customer_id']\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "baseline.csv").write_text(
+        "customer_id,amount\n"
+        "1,10.5\n"
+        "2,20.0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "orders.csv").write_text(
+        "client_id,amount\n"
+        "1,10.5\n"
+        "2,\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "error.log").write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/app/pipeline.py", line 4, in clean_orders\n'
+        "    return df['customer_id']\n"
+        "KeyError: 'customer_id'\n",
+        encoding="utf-8",
+    )
+
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="pipeline.py", file_type="code", size_bytes=100, storage_path=str(tmp_path / "pipeline.py")),
+        ProjectFile(id="f2", project_id="p1", relative_path="orders.csv", file_type="data", size_bytes=100, storage_path=str(tmp_path / "orders.csv")),
+        ProjectFile(id="f3", project_id="p1", relative_path="error.log", file_type="log", size_bytes=100, storage_path=str(tmp_path / "error.log")),
+    ]
+
+    log_res = await AnalyzeLogsTool().execute(str(tmp_path), {"log_path": "error.log"})
+    prof_res = await ProfileDatasetTool().execute(str(tmp_path), {"dataset_path": "orders.csv"})
+    code_res = await InspectCodeTool().execute(str(tmp_path), {"file_path": "pipeline.py"})
+    dep_res = await TraceDependenciesTool().execute(str(tmp_path), {"target_component": "pipeline.py"})
+    sch_res = await InspectSchemaTool().execute(str(tmp_path), {"dataset_path": "orders.csv", "baseline_path": "baseline.csv"})
+
+    execs = [
+        ToolExecution(id="E-LOG", investigation_id="I-REAL", tool_name="analyze_logs", status="success", output_result=log_res.data),
+        ToolExecution(id="E-PROF", investigation_id="I-REAL", tool_name="profile_dataset", status="success", output_result=prof_res.data),
+        ToolExecution(id="E-CODE", investigation_id="I-REAL", tool_name="inspect_code", status="success", output_result=code_res.data),
+        ToolExecution(id="E-DEP", investigation_id="I-REAL", tool_name="trace_dependencies", status="success", output_result=dep_res.data),
+        ToolExecution(id="E-SCH", investigation_id="I-REAL", tool_name="inspect_schema", status="success", output_result=sch_res.data),
+    ]
+
+    # 1. analyze_logs real schema
+    s_log, _, tid_log = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="log_stacktrace",
+            line_number=4,
+            column_name="customer_id",
+            observation="KeyError on customer_id in clean_orders at line 4",
+        ),
+        files, execs, investigation_id="I-REAL", workspace_dir=tmp_path,
+    )
+    assert s_log == "verified" and tid_log == "E-LOG"
+
+    # 2. profile_dataset real schema (`column_profiles`)
+    s_prof, _, tid_prof = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="orders.csv",
+            evidence_type="dataset_anomaly",
+            column_name="amount",
+            observation="amount column has 1 null value",
+        ),
+        files, execs, investigation_id="I-REAL", workspace_dir=tmp_path,
+    )
+    assert s_prof == "verified" and tid_prof == "E-PROF"
+
+    # 3. inspect_code real schema (`line_start`, `line_end`, `arguments`)
+    s_code, _, tid_code = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="code_ast",
+            line_number=2,
+            observation="Function clean_orders is defined at line 2 with parameter df",
+        ),
+        files, execs, investigation_id="I-REAL", workspace_dir=tmp_path,
+    )
+    assert s_code == "verified" and tid_code == "E-CODE"
+
+    # 4. trace_dependencies real schema (`stages`, `edges`, `target_analysis`)
+    s_dep, _, tid_dep = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            observation="pipeline.py depends on orders.csv",
+        ),
+        files, execs, investigation_id="I-REAL", workspace_dir=tmp_path,
+    )
+    assert s_dep == "verified" and tid_dep == "E-DEP"
+
+    # 5. inspect_schema real schema (`differences.missing_columns`, `renamed_candidates`)
+    s_sch, _, tid_sch = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="orders.csv",
+            evidence_type="schema_diff",
+            column_name="customer_id",
+            observation="Schema diff: customer_id column is missing",
+        ),
+        files, execs, investigation_id="I-REAL", workspace_dir=tmp_path,
+    )
+    assert s_sch == "verified" and tid_sch == "E-SCH"
+
+    # Also verify cross-tool distorted claims fail closed against real tool outputs:
+    s_false_dep, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="pipeline.py",
+            evidence_type="dependency_graph",
+            tool_execution_id="E-DEP",
+            observation="orders.csv depends on pipeline.py",
+        ),
+        files, execs, investigation_id="I-REAL", workspace_dir=tmp_path,
+    )
+    assert s_false_dep == "unverified"
+
+    s_false_col, _, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="orders.csv",
+            evidence_type="dataset_anomaly",
+            column_name="client_id",
+            tool_execution_id="E-PROF",
+            observation="client_id has 1 null value",
+        ),
+        files, execs, investigation_id="I-REAL", workspace_dir=tmp_path,
+    )
+    assert s_false_col == "unverified"
+
+
+
 

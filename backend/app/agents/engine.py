@@ -78,19 +78,23 @@ COMMON_OBSERVATIONAL_TERMS = frozenset({
     "is", "was", "are", "were", "be", "been", "being", "have", "has", "had", "do",
     "does", "did", "and", "or", "but", "if", "then", "else", "when", "where", "which",
     "that", "this", "these", "those", "it", "its", "as", "into", "during", "after", "before",
+    "while", "whereas", "not", "out", "any", "all", "zero", "none", "only", "both",
     "file", "files", "path", "line", "lines", "lineno", "code", "source", "module", "script",
     "raised", "threw", "thrown", "occurred", "found", "detected", "observed", "reported",
     "shows", "recorded", "indicates", "contains", "column", "columns", "row", "rows",
     "dataset", "data", "dataframe", "df", "table", "field", "fields", "value", "values",
-    "record", "records", "count", "total", "percentage", "type", "dtype", "inferred",
-    "null", "nulls", "nan", "missing", "duplicate", "duplicates", "empty",
+    "record", "records", "count", "total", "percentage", "percent", "type", "dtype", "inferred",
+    "null", "nulls", "nan", "missing", "duplicate", "duplicates", "empty", "distinct", "unique",
     "function", "functions", "class", "classes", "method", "methods", "def", "import", "imports",
     "package", "packages", "dependency", "dependencies", "depends", "depended", "requires", "required",
+    "statement", "statements", "declares", "installed", "requirement", "used", "consumed", "consumer", "consumers",
+    "pattern", "parameter", "parameters", "argument", "arguments", "signature", "reads", "writes", "stage", "stages",
+    "node", "nodes", "edge", "edges",
     "traceback", "stacktrace", "frame", "frames", "error", "errors", "exception", "exceptions",
     "failure", "fail", "failed", "fatal", "log", "logs", "output", "result", "results",
     "status", "test", "tests", "check", "checks", "syntax", "ast", "inspect", "profile",
     "pipeline", "number", "actual", "expected", "present", "defined", "definition", "call", "calls",
-    "drift", "schema", "diff", "added", "dropped", "removed", "new", "incompatible", "mismatch",
+    "drift", "schema", "diff", "added", "dropped", "removed", "new", "unexpected", "incompatible", "mismatch",
     "directly", "upstream", "downstream"
 })
 
@@ -107,39 +111,1063 @@ def contains_behavioral_claim(text: str) -> bool:
     return bool(words & BEHAVIORAL_KEYWORDS)
 
 
-def extract_all_telemetry_tokens(output_result: Any) -> set[str]:
-    """Recursively extracts all lowercase alphanumeric tokens from structured tool output."""
-    tokens = set()
-    def _recurse(val: Any):
-        if isinstance(val, str):
-            tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', val.lower()))
-        elif isinstance(val, (int, float, bool)):
-            tokens.add(str(val).lower())
-        elif isinstance(val, dict):
-            for k, v in val.items():
-                if isinstance(k, str):
-                    tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', k.lower()))
-                _recurse(v)
-        elif isinstance(val, (list, tuple, set)):
-            for item in val:
-                _recurse(item)
-    _recurse(output_result)
-    return tokens
-
-
-def check_observation_unsupported_assertions(
-    obs_lower: str,
-    ground_truth_tokens: set[str]
-) -> bool:
+def _has_uncorroborated_words(obs_lower: str, allowed_terms: set[str]) -> bool:
     """
-    Rigorously checks whether the observation contains substantive factual claims
-    that have NO corresponding structured evidence in the tool output.
-    Returns True if the observation contains uncorroborated substantive assertions (mixed claim).
+    Checks whether an observation contains substantive factual tokens outside of
+    common observational terms and the explicitly corroborated entities/fields/values
+    for the specific structured claim.
     """
     words_in_obs = set(re.findall(r'[a-zA-Z0-9_]{3,}', obs_lower))
-    substantive_words = {w for w in words_in_obs if w not in COMMON_OBSERVATIONAL_TERMS}
-    unsupported = {w for w in substantive_words if w not in ground_truth_tokens}
-    return bool(unsupported)
+    generic_words = {"error", "missing", "failed", "invalid", "exception", "bug", "crash", "issue", "problem", "terminat"}
+    expanded_allowed = set(allowed_terms)
+    for t in allowed_terms:
+        expanded_allowed.update(re.findall(r'[a-zA-Z0-9_]{2,}', str(t).lower()))
+    substantive = words_in_obs - COMMON_OBSERVATIONAL_TERMS - generic_words - expanded_allowed
+    return bool(substantive)
+
+
+def _verify_log_telemetry(
+    ev_input: AgentEvidenceInput,
+    src_norm: str,
+    te: ToolExecution,
+    out_data: Dict[str, Any],
+    project_paths: set[str],
+    workspace_dir: Optional[Path] = None
+) -> Tuple[str, bool, Optional[str]]:
+    """
+    Verifies exception & log evidence preserving relationships between:
+    - source file path and frame location
+    - exact line number in that frame
+    - exception type and exception message tied to that specific traceback
+    """
+    obs_lower = ev_input.observation.lower()
+
+    tracebacks = out_data.get("tracebacks", [])
+    fatal_error = out_data.get("fatal_error")
+
+    if not tracebacks and not fatal_error:
+        return "unverified", False, None
+
+    tb_entries: List[Dict[str, Any]] = []
+    if isinstance(tracebacks, list):
+        tb_entries.extend(tb for tb in tracebacks if isinstance(tb, dict))
+    if fatal_error and isinstance(fatal_error, dict):
+        tb_entries.append(fatal_error)
+
+    target_line = ev_input.line_number
+    m_line = re.search(r'\bline\s+(\d+)\b', obs_lower) or re.search(r'\.py:(\d+)\b', obs_lower)
+    obs_line = int(m_line.group(1)) if m_line else None
+    claimed_line = target_line if target_line is not None else obs_line
+
+    # Collect all (tb, frame) pairs matching the source file and claimed line
+    matching_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for tb in tb_entries:
+        frames = tb.get("frames", [])
+        if not frames and tb.get("last_frame"):
+            frames = [tb["last_frame"]]
+
+        for fr in frames:
+            if not isinstance(fr, dict):
+                continue
+            fr_file = fr.get("file", "")
+            resolved_fr = resolve_frame_to_project_relative(fr_file, project_paths, workspace_dir=workspace_dir)
+            if resolved_fr and resolved_fr == src_norm:
+                fr_line = fr.get("line")
+                if claimed_line is None or fr_line == claimed_line:
+                    # Also enforce obs_line if both target_line and obs_line were given
+                    if obs_line is None or fr_line == obs_line:
+                        matching_pairs.append((tb, fr))
+
+    if not matching_pairs:
+        return "unverified", False, None
+
+    generic_words = {"error", "missing", "failed", "invalid", "exception", "bug", "crash", "issue", "problem", "terminat"}
+    words_in_obs = set(re.findall(r'[a-zA-Z0-9_]{3,}', obs_lower))
+    non_generic_words = words_in_obs - generic_words
+    known_py_exceptions = {
+        "keyerror", "valueerror", "typeerror", "filenotfounderror",
+        "zerodivisionerror", "indexerror", "attributeerror", "importerror",
+        "modulenotfounderror", "runtimeerror", "memoryerror", "assertionerror",
+        "timeouterror", "permissionerror", "oserror", "ioerror", "syntaxerror",
+        "nameerror", "lookuperror", "overflowerror", "recursionerror", "eoferror",
+        "connectionerror", "unicodeerror", "unicodedecodeerror", "jsondecodeerror"
+    }
+    mentioned_known_exceptions = words_in_obs & known_py_exceptions
+    claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
+
+    best_log_res: Optional[Tuple[str, bool, Optional[str]]] = None
+
+    for matching_tb, matching_frame in matching_pairs:
+        exc_type = str(matching_tb.get("exception_type", "")).lower()
+        exc_msg = str(matching_tb.get("exception_message") or matching_tb.get("message") or "").lower()
+        code_line = str(matching_frame.get("code_line", "")).lower()
+
+        if mentioned_known_exceptions and (not exc_type or exc_type not in mentioned_known_exceptions):
+            continue
+
+        # If column_name was explicitly asserted on this log evidence, it must appear in THIS traceback's message or code line
+        if ev_input.column_name:
+            col_low = ev_input.column_name.lower()
+            if col_low not in exc_msg and col_low not in code_line:
+                continue
+
+        matched_exc_type = bool(exc_type and exc_type in obs_lower)
+        msg_tokens = [
+            w.lower() for w in re.findall(r'[a-zA-Z0-9_]{3,}', exc_msg)
+            if w.lower() not in generic_words
+        ]
+        code_tokens = [
+            w.lower() for w in re.findall(r'[a-zA-Z0-9_]{3,}', code_line)
+            if w.lower() not in generic_words
+        ]
+        matched_exc_msg = any(tok in obs_lower for tok in msg_tokens)
+
+        if not ((matched_exc_type or matched_exc_msg) and non_generic_words):
+            continue
+
+        # Reject any numerical claim that contradicts THIS matching traceback record
+        valid_nums = set()
+        if matching_frame.get("line") is not None:
+            valid_nums.add(str(matching_frame["line"]))
+        valid_nums.update(re.findall(r'\b\d+(?:\.\d+)?%?\b', exc_msg))
+        if claimed_numbers and any(num not in valid_nums for num in claimed_numbers):
+            continue
+
+        if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+            if best_log_res is None:
+                best_log_res = ("inference", True, te.id)
+            continue
+
+        allowed_terms = {exc_type} | set(msg_tokens) | set(code_tokens) | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+        if matching_frame.get("function"):
+            allowed_terms.add(str(matching_frame["function"]).lower())
+        allowed_terms.update(valid_nums)
+
+        if _has_uncorroborated_words(obs_lower, allowed_terms):
+            if best_log_res is None:
+                best_log_res = ("inference", True, te.id)
+            continue
+
+        return "verified", False, te.id
+
+    if best_log_res is not None:
+        return best_log_res
+    return "unverified", False, None
+
+
+def _verify_single_dataset_clause(
+    clause_lower: str,
+    target_col: Optional[str],
+    col_profiles: Dict[str, Any],
+    anomalies: List[Dict[str, Any]],
+    all_known_cols: set[str],
+    total_rows: Any,
+    duplicate_rows: Any,
+    src_norm: str,
+    te_id: str,
+    extra_allowed_cols: Optional[set[str]] = None
+) -> Tuple[str, bool, Optional[str]]:
+    """Verifies a single dataset-related claim clause bound strictly to its target column/measurement."""
+    is_null_claim = any(kw in clause_lower for kw in (
+        "null", "nan", "missing value", "missing values", "empty value", "empty values", "none value", "none values"
+    ))
+    is_dup_claim = any(kw in clause_lower for kw in ("duplicate", "repeated row", "repeated record"))
+    is_row_count_claim = any(kw in clause_lower for kw in ("row count", "total rows", "records loaded", "rows in dataset"))
+    is_type_claim = any(kw in clause_lower for kw in ("data type", "datatype", "type is", "dtype", "inferred type"))
+    is_distinct_claim = any(kw in clause_lower for kw in ("distinct count", "distinct values", "unique values", "distinct_count"))
+    is_numeric_stat_claim = any(
+        re.search(r'\b' + kw + r'\b', clause_lower)
+        for kw in ("min", "minimum", "max", "maximum", "mean", "average", "median", "std", "standard deviation")
+    )
+    claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', clause_lower)
+
+    # 1. Null / Missing Value Claim
+    if is_null_claim:
+        if not target_col or target_col not in all_known_cols:
+            return "unverified", False, None
+
+        prof = col_profiles.get(target_col, {})
+        col_anomalies = [a for a in anomalies if isinstance(a, dict) and str(a.get("column", "")).lower() == target_col]
+
+        # Must actually have null telemetry for this column (never default missing field to 0)
+        null_from_prof = prof.get("null_count")
+        null_from_anom = [a.get("null_count") for a in col_anomalies if "null" in str(a.get("type", "")).lower() and a.get("null_count") is not None]
+        if null_from_prof is None and not null_from_anom:
+            return "unverified", False, None
+
+        actual_null_count = max([v for v in ([null_from_prof] + null_from_anom) if v is not None])
+        actual_null_pct = prof.get("null_percentage")
+        if actual_null_pct is None:
+            for a in col_anomalies:
+                if a.get("null_percentage") is not None:
+                    actual_null_pct = a["null_percentage"]
+                    break
+
+        claims_zero_nulls = bool(
+            re.search(r'\b(?:0|zero|no|without)\s+(?:null|nulls|nan|missing|empty)\b', clause_lower)
+            or re.search(r'\bnull(?:_|\s)?(?:count|values?|percentage)\s*(?:is|are|=|:|of)?\s*(?:0|0\.0%?)\b', clause_lower)
+            or re.search(r'\bmissing\s+(?:values?|count)\s*(?:is|are|=|:|of)?\s*(?:0|0\.0%?)\b', clause_lower)
+        )
+        if claims_zero_nulls:
+            if actual_null_count != 0:
+                return "unverified", False, None
+        elif actual_null_count == 0:
+            # Column has 0 nulls; claiming it has null values is FALSE
+            return "unverified", False, None
+
+        valid_count_strs = {str(actual_null_count)}
+        valid_pct_with_sign: set[str] = set()
+        valid_pct_bare: set[str] = set()
+        if actual_null_pct is not None:
+            valid_pct_bare.update({
+                str(actual_null_pct),
+                f"{actual_null_pct:.1f}",
+                f"{actual_null_pct:.2f}",
+                f"{actual_null_pct:.0f}",
+                f"{actual_null_pct:g}",
+            })
+            valid_pct_with_sign = {f"{p}%" for p in valid_pct_bare}
+
+        has_pct_word = bool(re.search(r'\b(?:percent|percentage)\b', clause_lower))
+        if claimed_numbers:
+            for num in claimed_numbers:
+                if num.endswith("%"):
+                    if num not in valid_pct_with_sign:
+                        return "unverified", False, None
+                else:
+                    if num in valid_count_strs:
+                        continue
+                    if has_pct_word and num in valid_pct_bare:
+                        continue
+                    # Do NOT allow null_percentage bare numbers or unrelated telemetry numbers to masquerade as null_count!
+                    return "unverified", False, None
+
+        if contains_causal_explanation(clause_lower) or contains_behavioral_claim(clause_lower):
+            return "inference", True, te_id
+
+        allowed_terms = {target_col} | valid_count_strs | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | (extra_allowed_cols or set())
+        if valid_pct_with_sign or (has_pct_word and valid_pct_bare):
+            allowed_terms.update(valid_pct_with_sign)
+            allowed_terms.update(valid_pct_bare)
+        if _has_uncorroborated_words(clause_lower, allowed_terms):
+            return "inference", True, te_id
+
+        return "verified", False, te_id
+
+    # 2. Duplicate rows claim
+    elif is_dup_claim:
+        if duplicate_rows is None:
+            return "unverified", False, None
+        claims_zero_dups = bool(
+            re.search(r'\b(?:0|zero|no|without)\s+duplicate', clause_lower)
+            or re.search(r'\bduplicate_?(?:rows|count)?\s*(?:is|are|=|:)?\s*0\b', clause_lower)
+        )
+        if claims_zero_dups:
+            if duplicate_rows != 0:
+                return "unverified", False, None
+        elif duplicate_rows == 0:
+            return "unverified", False, None
+
+        if claimed_numbers and any(num != str(duplicate_rows) for num in claimed_numbers):
+            return "unverified", False, None
+
+        if contains_causal_explanation(clause_lower) or contains_behavioral_claim(clause_lower):
+            return "inference", True, te_id
+
+        allowed_terms = {str(duplicate_rows)} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | (extra_allowed_cols or set())
+        if target_col:
+            allowed_terms.add(target_col)
+        if _has_uncorroborated_words(clause_lower, allowed_terms):
+            return "inference", True, te_id
+
+        return "verified", False, te_id
+
+    # 3. Total rows / Row count claim
+    elif is_row_count_claim:
+        if total_rows is None:
+            return "unverified", False, None
+        if claimed_numbers and any(num != str(total_rows) for num in claimed_numbers):
+            return "unverified", False, None
+
+        if contains_causal_explanation(clause_lower) or contains_behavioral_claim(clause_lower):
+            return "inference", True, te_id
+
+        allowed_terms = {str(total_rows)} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | (extra_allowed_cols or set())
+        if target_col:
+            allowed_terms.add(target_col)
+        if _has_uncorroborated_words(clause_lower, allowed_terms):
+            return "inference", True, te_id
+
+        return "verified", False, te_id
+
+    # 4. Data type / Dtype claim
+    elif is_type_claim and target_col:
+        prof = col_profiles.get(target_col, {})
+        actual_dtype = str(prof.get("dtype") or prof.get("inferred_type", "")).lower()
+        if not actual_dtype or actual_dtype not in clause_lower:
+            return "unverified", False, None
+        if claimed_numbers:
+            # Numbers unrelated to dtype strings must not sneak in unverified
+            return "unverified", False, None
+        if contains_causal_explanation(clause_lower) or contains_behavioral_claim(clause_lower):
+            return "inference", True, te_id
+        allowed_terms = {target_col, actual_dtype} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | (extra_allowed_cols or set())
+        if _has_uncorroborated_words(clause_lower, allowed_terms):
+            return "inference", True, te_id
+        return "verified", False, te_id
+
+    # 5. Distinct count claim for a specific column
+    elif is_distinct_claim and target_col:
+        prof = col_profiles.get(target_col, {})
+        distinct_count = prof.get("distinct_count")
+        if distinct_count is None:
+            return "unverified", False, None
+        if not claimed_numbers or any(num != str(distinct_count) for num in claimed_numbers):
+            return "unverified", False, None
+        if contains_causal_explanation(clause_lower) or contains_behavioral_claim(clause_lower):
+            return "inference", True, te_id
+        allowed_terms = {target_col, str(distinct_count), "distinct", "unique"} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | (extra_allowed_cols or set())
+        if _has_uncorroborated_words(clause_lower, allowed_terms):
+            return "inference", True, te_id
+        return "verified", False, te_id
+
+    # 6. Numeric stats claim (min, max, mean, median, std) for a specific column
+    elif is_numeric_stat_claim and target_col:
+        prof = col_profiles.get(target_col, {})
+        num_stats = prof.get("numeric_stats") if isinstance(prof.get("numeric_stats"), dict) else {}
+        if not num_stats:
+            return "unverified", False, None
+
+        stat_key_map = {
+            "min": "min", "minimum": "min",
+            "max": "max", "maximum": "max",
+            "mean": "mean", "average": "mean",
+            "median": "median",
+            "std": "std", "standard deviation": "std",
+        }
+        valid_stat_nums: set[str] = set()
+        allowed_terms = {target_col} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | (extra_allowed_cols or set())
+        stat_vals_by_key: Dict[str, set[str]] = {}
+        for phrase, stat_k in stat_key_map.items():
+            if re.search(r'\b' + phrase + r'\b', clause_lower):
+                val = num_stats.get(stat_k)
+                if val is None:
+                    # Claimed a numeric stat not present in this column's telemetry
+                    return "unverified", False, None
+                svals = {str(val)}
+                if isinstance(val, (int, float)) and float(val).is_integer():
+                    svals.add(str(int(val)))
+                stat_vals_by_key[stat_k] = svals
+                valid_stat_nums.update(svals)
+                allowed_terms.update(phrase.split())
+                allowed_terms.add(stat_k)
+
+        # Enforce pairwise binding when a number explicitly follows a stat keyword (prevents swapping min/max)
+        for m_pair in re.finditer(
+            r'\b(min|minimum|max|maximum|mean|average|median|std|standard deviation)\b(?:\s+(?:is|of|=|:))?\s+(\d+(?:\.\d+)?)\b',
+            clause_lower
+        ):
+            sk = stat_key_map[m_pair.group(1)]
+            claimed_val = m_pair.group(2)
+            if claimed_val not in stat_vals_by_key.get(sk, set()):
+                return "unverified", False, None
+
+        if not valid_stat_nums or not claimed_numbers or any(num not in valid_stat_nums for num in claimed_numbers):
+            return "unverified", False, None
+        if contains_causal_explanation(clause_lower) or contains_behavioral_claim(clause_lower):
+            return "inference", True, te_id
+        allowed_terms.update(valid_stat_nums)
+        if _has_uncorroborated_words(clause_lower, allowed_terms):
+            return "inference", True, te_id
+        return "verified", False, te_id
+
+    # 7. Column-specific non-null anomalies or ungrounded semantic claims
+    elif target_col and target_col in all_known_cols:
+        prof = col_profiles.get(target_col, {})
+        col_anomalies = [a for a in anomalies if isinstance(a, dict) and str(a.get("column", "")).lower() == target_col]
+        if col_anomalies:
+            allowed_nums: set[str] = set()
+            allowed_terms = {target_col} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | (extra_allowed_cols or set())
+            for a in col_anomalies:
+                if a.get("type"):
+                    allowed_terms.update(str(a["type"]).lower().split("_"))
+                for k in ("null_count", "unparsable_count", "numeric_parsable_count"):
+                    if k in a and a[k] is not None:
+                        allowed_nums.add(str(a[k]))
+                if a.get("null_percentage") is not None:
+                    pct = a["null_percentage"]
+                    allowed_nums.update({f"{pct}%", f"{pct:.1f}%", f"{pct:.2f}%", f"{pct:.0f}%"})
+            if claimed_numbers and any(num not in allowed_nums for num in claimed_numbers):
+                return "unverified", False, None
+            if contains_causal_explanation(clause_lower) or contains_behavioral_claim(clause_lower):
+                return "inference", True, te_id
+            allowed_terms.update(allowed_nums)
+            if _has_uncorroborated_words(clause_lower, allowed_terms):
+                return "inference", True, te_id
+            return "verified", False, te_id
+        else:
+            # No anomalies for this column; must have actual profile fields (incomplete profile cannot support even inference)
+            if not prof:
+                return "unverified", False, None
+            # Reject invented numbers when claiming ungrounded semantic attributes
+            if claimed_numbers:
+                return "unverified", False, None
+            return "inference", True, te_id
+
+    return "unverified", False, None
+
+
+def _verify_dataset_telemetry(
+    ev_input: AgentEvidenceInput,
+    src_norm: str,
+    te: ToolExecution,
+    out_data: Dict[str, Any]
+) -> Tuple[str, bool, Optional[str]]:
+    """
+    Verifies dataset profiling evidence strictly preserving associations between:
+    - dataset column name and its own individual profile statistics
+    - numerical values and the specific measurement (e.g. null_count vs total_rows)
+    """
+    obs_lower = ev_input.observation.lower()
+
+    raw_col_profiles = out_data.get("column_profiles") or out_data.get("columns") or {}
+    col_profiles: Dict[str, Any] = {}
+    if isinstance(raw_col_profiles, dict):
+        for k, v in raw_col_profiles.items():
+            if isinstance(v, dict):
+                col_profiles[k.lower()] = v
+
+    anomalies: List[Dict[str, Any]] = out_data.get("anomalies") or []
+    dataset_stats = out_data.get("dataset") if isinstance(out_data.get("dataset"), dict) else {}
+    total_rows = out_data.get("total_rows") if out_data.get("total_rows") is not None else dataset_stats.get("total_rows")
+    duplicate_rows = out_data.get("duplicate_rows") if out_data.get("duplicate_rows") is not None else dataset_stats.get("duplicate_rows")
+
+    if not col_profiles and not anomalies and total_rows is None and duplicate_rows is None:
+        return "unverified", False, None
+
+    all_known_cols = set(col_profiles.keys())
+    for a in anomalies:
+        if isinstance(a, dict) and "column" in a:
+            all_known_cols.add(str(a["column"]).lower())
+    all_known_cols_sorted = sorted(all_known_cols)
+
+    explicit_col = ev_input.column_name.lower() if ev_input.column_name else None
+    words_in_obs = set(re.findall(r'[a-zA-Z0-9_]+', obs_lower))
+    mentioned_cols = [c for c in all_known_cols_sorted if c in words_in_obs]
+
+    # Reject structured column_name spoofing when observation targets a completely different column
+    if explicit_col and mentioned_cols and explicit_col not in mentioned_cols:
+        return "unverified", False, None
+
+    global_metric_kws = (
+        "duplicate", "repeated row", "repeated record",
+        "row count", "total rows", "records loaded", "rows in dataset"
+    )
+    metric_claim_kws = (
+        "null", "nan", "missing", "empty", "duplicate", "repeated row",
+        "row count", "total rows", "records loaded", "dtype", "data type", "type is",
+        "distinct", "unique", "min", "max", "mean", "median", "std", "mismatch", "anomaly"
+    )
+    clauses = [c.strip() for c in re.split(r'\.(?=\s|$)|[;]|\b(?:while|whereas)\b', obs_lower) if c.strip()]
+    expanded_clauses: List[str] = []
+    for cl in clauses:
+        sub = [s.strip() for s in re.split(r',\s*(?:and\s+)?|\band\b', cl) if s.strip()]
+        if len(sub) > 1 and all(
+            (
+                (any(re.search(r'\b' + re.escape(col) + r'\b', s) for col in all_known_cols_sorted) and any(kw in s for kw in metric_claim_kws))
+                or any(gkw in s for gkw in global_metric_kws)
+            )
+            for s in sub
+        ):
+            expanded_clauses.extend(sub)
+        else:
+            expanded_clauses.append(cl)
+
+    overall_status = "verified"
+    overall_inf = False
+    for cl in expanded_clauses:
+        cl_cols = [c for c in all_known_cols_sorted if re.search(r'\b' + re.escape(c) + r'\b', cl)]
+        cols_to_check = cl_cols if cl_cols else [explicit_col]
+        extra_cols = set(cl_cols) if len(cl_cols) > 1 else None
+        for t_col in cols_to_check:
+            s, _, _ = _verify_single_dataset_clause(
+                cl,
+                t_col,
+                col_profiles,
+                anomalies,
+                all_known_cols,
+                total_rows,
+                duplicate_rows,
+                src_norm,
+                te.id,
+                extra_allowed_cols=extra_cols
+            )
+            if s == "unverified":
+                return "unverified", False, None
+            elif s == "inference":
+                overall_status = "inference"
+                overall_inf = True
+
+    return overall_status, overall_inf, te.id
+
+
+def _verify_code_ast_telemetry(
+    ev_input: AgentEvidenceInput,
+    src_norm: str,
+    te: ToolExecution,
+    out_data: Dict[str, Any],
+    project_paths: Optional[set[str]] = None,
+    workspace_dir: Optional[Path] = None
+) -> Tuple[str, bool, Optional[str]]:
+    """
+    Verifies AST code inspection facts preserving associations between:
+    - source file path
+    - function/class definitions and line ranges
+    Strictly prohibits deriving runtime behavior or performance optimizations from AST syntax alone.
+    """
+    obs_lower = ev_input.observation.lower()
+
+    telemetry_file = out_data.get("file")
+    if telemetry_file:
+        tel_str = str(telemetry_file).strip()
+        if os.path.isabs(tel_str) and project_paths:
+            resolved_tel = resolve_frame_to_project_relative(tel_str, project_paths, workspace_dir=workspace_dir)
+            if resolved_tel != src_norm:
+                return "unverified", False, None
+        else:
+            norm_tel_file = os.path.normpath(tel_str).lstrip("/\\")
+            if norm_tel_file != src_norm:
+                return "unverified", False, None
+
+    fns = out_data.get("functions", [])
+    classes = out_data.get("classes", [])
+    imports = out_data.get("imports", [])
+
+    if not fns and not classes and not imports:
+        return "unverified", False, None
+
+    fn_dict = {f["name"].lower(): f for f in fns if isinstance(f, dict) and f.get("name")}
+    class_dict = {c["name"].lower(): c for c in classes if isinstance(c, dict) and c.get("name")}
+    import_names = {str(imp).lower() for imp in imports}
+
+    # Check explicitly named function/method before falling back to any function name in observation
+    stop_after_kw = COMMON_OBSERVATIONAL_TERMS | BEHAVIORAL_KEYWORDS | {
+        "removes", "detects", "prevents", "filters", "sanitizes", "drops", "bypasses",
+        "validates", "decrypts", "encrypts", "optimizes", "computes", "transforms",
+        "executes", "processes", "modifies", "takes", "returns", "uses", "calls",
+        "can", "will", "should", "may", "might", "could", "named", "called"
+    }
+    claimed_fn_name = None
+    m_fn_before = re.search(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:function|method)\b', obs_lower)
+    m_fn_after = re.search(r'\b(?:function|def|method)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', obs_lower)
+    if m_fn_before and m_fn_before.group(1).lower() not in stop_after_kw:
+        claimed_fn_name = m_fn_before.group(1).lower()
+    elif m_fn_after and m_fn_after.group(1).lower() not in stop_after_kw:
+        claimed_fn_name = m_fn_after.group(1).lower()
+
+    if claimed_fn_name and claimed_fn_name not in fn_dict:
+        # Explicitly claimed function does NOT exist in AST telemetry
+        return "unverified", False, None
+
+    matched_fn = fn_dict.get(claimed_fn_name) if claimed_fn_name else None
+    if not matched_fn:
+        for fn_name, f in fn_dict.items():
+            if len(fn_name) > 2 and re.search(r'\b' + re.escape(fn_name) + r'\b', obs_lower):
+                matched_fn = f
+                break
+
+    matched_cls = None
+    if not matched_fn:
+        for cls_name, c in class_dict.items():
+            if len(cls_name) > 2 and re.search(r'\b' + re.escape(cls_name) + r'\b', obs_lower):
+                matched_cls = c
+                break
+        if not matched_cls:
+            m_cls_name = re.search(r'\bclass\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', obs_lower)
+            if m_cls_name and m_cls_name.group(1).lower() not in COMMON_OBSERVATIONAL_TERMS:
+                if m_cls_name.group(1).lower() not in class_dict:
+                    return "unverified", False, None
+
+    matched_import = None
+    if not matched_fn and not matched_cls:
+        for imp in import_names:
+            if len(imp) > 2 and re.search(r'\b' + re.escape(imp) + r'\b', obs_lower):
+                matched_import = imp
+                break
+
+    if not matched_fn and not matched_cls and not matched_import:
+        return "unverified", False, None
+
+    # Validate explicit column_name against referenced columns or function args if provided
+    if ev_input.column_name:
+        col_low = ev_input.column_name.lower()
+        col_refs = {str(cr.get("column", "")).lower() for cr in out_data.get("column_references", []) if isinstance(cr, dict)}
+        fn_args = {str(a).lower() for a in ((matched_fn.get("arguments") or matched_fn.get("args") or []) if matched_fn else [])}
+        if col_low not in col_refs and col_low not in fn_args:
+            return "unverified", False, None
+
+    # Line number & numeric verification strictly against the matched entity
+    m_line = re.search(r'\bline\s+(\d+)\b', obs_lower)
+    obs_line = int(m_line.group(1)) if m_line else None
+    check_line = ev_input.line_number if ev_input.line_number is not None else obs_line
+
+    valid_ast_nums: set[str] = set()
+    if matched_fn:
+        start_l = matched_fn.get("line_start", matched_fn.get("lineno"))
+        end_l = matched_fn.get("line_end", matched_fn.get("end_lineno", start_l))
+        if start_l is not None:
+            valid_ast_nums.add(str(start_l))
+            if end_l is not None:
+                valid_ast_nums.add(str(end_l))
+            if check_line is not None and not (start_l <= check_line <= (end_l or start_l) or start_l == check_line):
+                return "unverified", False, None
+            if obs_line is not None and not (start_l <= obs_line <= (end_l or start_l) or start_l == obs_line):
+                return "unverified", False, None
+    elif matched_cls:
+        start_l = matched_cls.get("lineno")
+        if start_l is not None:
+            valid_ast_nums.add(str(start_l))
+            if check_line is not None and start_l != check_line:
+                return "unverified", False, None
+            if obs_line is not None and start_l != obs_line:
+                return "unverified", False, None
+
+    if ev_input.line_number is not None:
+        valid_ast_nums.add(str(ev_input.line_number))
+
+    claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
+    if claimed_numbers and any(num not in valid_ast_nums for num in claimed_numbers):
+        return "unverified", False, None
+
+    # Enforce Rule 5: AST establishes static syntax, NEVER runtime behavior, data mutations, or optimizations
+    # Match whole identifier tokens (excluding matched entity names like transform_data)
+    obs_tokens = set(re.findall(r'[a-zA-Z0-9_]+', obs_lower))
+    excluded_names = set()
+    if matched_fn:
+        excluded_names.add(matched_fn["name"].lower())
+    if matched_cls:
+        excluded_names.add(matched_cls["name"].lower())
+    obs_verb_tokens = obs_tokens - excluded_names
+
+    ast_runtime_keywords = BEHAVIORAL_KEYWORDS | {
+        "optimizes", "optimize", "optimizing", "cache", "caches", "caching",
+        "throughput", "runtime", "execution", "executes", "execute", "executing",
+        "validates", "validate", "validating", "decrypts", "decrypt", "decrypting",
+        "encrypts", "encrypt", "encrypting", "processes", "process",
+        "modifies", "modify", "modifying", "computes", "compute", "computing",
+        "transforms", "transform", "transforming", "authenticates", "verifies",
+        "parses", "serializes", "sends", "writes", "persists"
+    }
+    is_runtime_or_behavioral = (
+        bool(obs_verb_tokens & ast_runtime_keywords)
+        or contains_causal_explanation(obs_lower)
+    )
+    if is_runtime_or_behavioral:
+        return "inference", True, te.id
+
+    allowed_terms = set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower())) | valid_ast_nums
+    if matched_fn:
+        allowed_terms.add(matched_fn["name"].lower())
+        for arg in (matched_fn.get("arguments") or matched_fn.get("args") or []):
+            allowed_terms.add(str(arg).lower())
+    if matched_cls:
+        allowed_terms.add(matched_cls["name"].lower())
+    if matched_import:
+        allowed_terms.add(matched_import)
+
+    if _has_uncorroborated_words(obs_lower, allowed_terms):
+        return "inference", True, te.id
+
+    return "verified", False, te.id
+
+
+def _verify_dependency_telemetry(
+    ev_input: AgentEvidenceInput,
+    src_norm: str,
+    te: ToolExecution,
+    out_data: Dict[str, Any]
+) -> Tuple[str, bool, Optional[str]]:
+    """
+    Verifies dependency evidence preserving source/destination nodes and edge direction.
+    Rejects reversed dependencies and unsupported claims.
+    """
+    obs_lower = ev_input.observation.lower()
+
+    src_lower = os.path.normpath(src_norm).lstrip("/\\").lower()
+    src_base = os.path.basename(src_lower)
+
+    # Directed edges stored as (upstream_node, downstream_node) normalized lowercase
+    directed_edges: set[Tuple[str, str]] = set()
+    upstream_deps: set[str] = set()
+    downstream_deps: set[str] = set()
+    src_imports: set[str] = set()
+    packages: set[str] = set()
+
+    for d in out_data.get("dependencies", []):
+        dl = str(d).lower()
+        upstream_deps.add(dl)
+        directed_edges.add((dl, src_lower))
+    for d in (out_data.get("reverse_dependencies") or out_data.get("dependents") or []):
+        dl = str(d).lower()
+        downstream_deps.add(dl)
+        directed_edges.add((src_lower, dl))
+    for imp in out_data.get("imports", []):
+        src_imports.add(str(imp).lower())
+    for pkg in out_data.get("packages", []):
+        packages.add(str(pkg).lower())
+
+    stages = out_data.get("stages", {})
+    if isinstance(stages, dict):
+        for st_key, stage_data in stages.items():
+            if not isinstance(stage_data, dict):
+                continue
+            st_norm = os.path.normpath(str(st_key)).lstrip("/\\").lower()
+            st_inputs = [str(inp).lower() for inp in stage_data.get("inputs", [])]
+            st_outputs = [str(out).lower() for out in stage_data.get("outputs", [])]
+            st_imports = [str(imp).lower() for imp in stage_data.get("imports", [])]
+            for inp in st_inputs:
+                directed_edges.add((inp, st_norm))
+            for out in st_outputs:
+                directed_edges.add((st_norm, out))
+            if st_norm == src_lower:
+                upstream_deps.update(st_inputs)
+                downstream_deps.update(st_outputs)
+                src_imports.update(st_imports)
+
+    edges = out_data.get("edges", [])
+    if isinstance(edges, list):
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            efrom = os.path.normpath(str(edge.get("from", ""))).lstrip("/\\").lower()
+            eto = os.path.normpath(str(edge.get("to", ""))).lstrip("/\\").lower()
+            rel = str(edge.get("relationship", "")).lower().strip()
+            if not efrom or not eto:
+                continue
+            if rel in ("depends_on", "imports", "requires", "uses"):
+                # efrom depends on eto -> eto is upstream of efrom
+                up_node, down_node = eto, efrom
+            else:
+                # Dataflow convention in trace_dependencies ("reads", "writes", ""): efrom feeds eto
+                up_node, down_node = efrom, eto
+            directed_edges.add((up_node, down_node))
+            if down_node == src_lower:
+                upstream_deps.add(up_node)
+            if up_node == src_lower:
+                downstream_deps.add(down_node)
+
+    target_analysis = out_data.get("target_analysis")
+    if isinstance(target_analysis, dict):
+        tgt = target_analysis.get("target")
+        if tgt:
+            tgt_norm = os.path.normpath(str(tgt)).lstrip("/\\").lower()
+            ta_up = [str(u).lower() for u in target_analysis.get("upstream", [])]
+            ta_down = [str(d).lower() for d in target_analysis.get("downstream", [])]
+            for u in ta_up:
+                directed_edges.add((u, tgt_norm))
+            for d in ta_down:
+                directed_edges.add((tgt_norm, d))
+            if tgt_norm == src_lower:
+                upstream_deps.update(ta_up)
+                downstream_deps.update(ta_down)
+
+    if not directed_edges and not upstream_deps and not downstream_deps and not src_imports and not packages:
+        return "unverified", False, None
+
+    def _matches_node(claim_node: str, tel_node: str) -> bool:
+        c = claim_node.rstrip(".,;:!?\"'")
+        t = tel_node.rstrip(".,;:!?\"'")
+        if c == t:
+            return True
+        # Only match src_base when claim_node is just filename and tel_node is src_lower
+        if t == src_lower and c == src_base:
+            return True
+        return False
+
+    def _has_directed_edge(up_claim: str, down_claim: str) -> bool:
+        up_c = up_claim.rstrip(".,;:!?\"'")
+        down_c = down_claim.rstrip(".,;:!?\"'")
+        for up_t, down_t in directed_edges:
+            if _matches_node(up_c, up_t) and _matches_node(down_c, down_t):
+                return True
+        return False
+
+    # Parse explicit directional binary assertions
+    m_depends = re.search(r'([\w\./\-]+)\s+(?:depends\s+(?:directly\s+)?on|directly\s+depends\s+on|requires|reads|consumes)\s+([\w\./\-]+)', obs_lower)
+    m_is_used_by = re.search(r'([\w\./\-]+)\s+(?:is\s+used\s+by|is\s+depended\s+on\s+by|is\s+consumed\s+by|is\s+read\s+by)\s+([\w\./\-]+)', obs_lower)
+    m_is_upstream_of = re.search(r'([\w\./\-]+)\s+is\s+(?:an?\s+)?upstream(?:\s+dependency)?\s+of\s+([\w\./\-]+)', obs_lower)
+    m_is_downstream_of = re.search(r'([\w\./\-]+)\s+is\s+(?:a\s+)?downstream(?:\s+consumer)?\s+of\s+([\w\./\-]+)', obs_lower)
+
+    is_direct_claim = bool(
+        m_depends
+        or m_is_upstream_of
+        or re.search(r'\bdepends\b(?:\s+\w+)?\s+on\b', obs_lower)
+        or any(kw in obs_lower for kw in ("requires", "upstream dependency", "direct dependency"))
+    )
+    is_reverse_claim = bool(
+        m_is_used_by
+        or m_is_downstream_of
+        or any(kw in obs_lower for kw in ("is used by", "depended on by", "downstream consumer", "reverse dependency"))
+    )
+    is_import_claim = any(kw in obs_lower for kw in ("imports", "imported from", "import statement"))
+    is_package_claim = any(kw in obs_lower for kw in ("declares package", "dependency package", "installed package", "package requirement"))
+
+    matched = False
+    matched_category = "edge"
+
+    if m_depends:
+        sub = m_depends.group(1).lower().strip(".,;:!?\"'")
+        obj = m_depends.group(2).lower().strip(".,;:!?\"'")
+        # "<sub > depends on <obj>" => obj is upstream of sub
+        if _has_directed_edge(obj, sub):
+            matched = True
+        else:
+            return "unverified", False, None
+
+    elif m_is_upstream_of:
+        sub = m_is_upstream_of.group(1).lower().strip(".,;:!?\"'")
+        obj = m_is_upstream_of.group(2).lower().strip(".,;:!?\"'")
+        # "<sub > is upstream of <obj>" => sub is upstream of obj
+        if _has_directed_edge(sub, obj):
+            matched = True
+        else:
+            return "unverified", False, None
+
+    elif m_is_used_by:
+        sub = m_is_used_by.group(1).lower().strip(".,;:!?\"'")
+        obj = m_is_used_by.group(2).lower().strip(".,;:!?\"'")
+        # "<sub > is used by <obj>" => sub is upstream of obj
+        if _has_directed_edge(sub, obj):
+            matched = True
+        else:
+            return "unverified", False, None
+
+    elif m_is_downstream_of:
+        sub = m_is_downstream_of.group(1).lower().strip(".,;:!?\"'")
+        obj = m_is_downstream_of.group(2).lower().strip(".,;:!?\"'")
+        # "<sub > is downstream of <obj>" => obj is upstream of sub
+        if _has_directed_edge(obj, sub):
+            matched = True
+        else:
+            return "unverified", False, None
+
+    elif is_direct_claim:
+        found_up = [d for d in upstream_deps if len(d) > 2 and re.search(r'\b' + re.escape(d) + r'\b', obs_lower)]
+        found_down = [d for d in downstream_deps if len(d) > 2 and re.search(r'\b' + re.escape(d) + r'\b', obs_lower)]
+        if found_down and not found_up:
+            return "unverified", False, None
+        elif found_up:
+            matched = True
+            matched_category = "upstream"
+        else:
+            return "unverified", False, None
+
+    elif is_reverse_claim:
+        found_down = [d for d in downstream_deps if len(d) > 2 and re.search(r'\b' + re.escape(d) + r'\b', obs_lower)]
+        found_up = [d for d in upstream_deps if len(d) > 2 and re.search(r'\b' + re.escape(d) + r'\b', obs_lower)]
+        if found_up and not found_down:
+            return "unverified", False, None
+        elif found_down:
+            matched = True
+            matched_category = "downstream"
+        else:
+            return "unverified", False, None
+
+    elif is_import_claim:
+        if any(re.search(r'\b' + re.escape(imp) + r'\b', obs_lower) for imp in src_imports if len(imp) > 2):
+            matched = True
+            matched_category = "imports"
+        else:
+            return "unverified", False, None
+
+    elif is_package_claim:
+        if any(pkg in obs_lower for pkg in packages if len(pkg) > 2):
+            matched = True
+            matched_category = "packages"
+        else:
+            return "unverified", False, None
+
+    else:
+        all_known = upstream_deps | downstream_deps | src_imports | packages
+        if any(k in obs_lower for k in all_known if len(k) > 2):
+            return "inference", True, te.id
+        return "unverified", False, None
+
+    if matched:
+        # Validate any claimed numerical counts against the matching dependency category
+        claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
+        valid_dep_nums: set[str] = set()
+        if matched_category == "upstream":
+            valid_dep_nums.add(str(len(upstream_deps)))
+        elif matched_category == "downstream":
+            valid_dep_nums.add(str(len(downstream_deps)))
+        elif matched_category == "imports":
+            valid_dep_nums.add(str(len(src_imports)))
+        elif matched_category == "packages":
+            for p in packages:
+                valid_dep_nums.update(re.findall(r'\b\d+(?:\.\d+)?\b', p))
+        else:
+            valid_dep_nums.add(str(len(directed_edges)))
+        if claimed_numbers and any(num not in valid_dep_nums for num in claimed_numbers):
+            return "unverified", False, None
+
+        if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+            return "inference", True, te.id
+
+        allowed_terms = upstream_deps | downstream_deps | src_imports | packages | {src_base} | valid_dep_nums
+        allowed_terms.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+        for up_t, down_t in directed_edges:
+            allowed_terms.add(up_t)
+            allowed_terms.add(down_t)
+        if _has_uncorroborated_words(obs_lower, allowed_terms):
+            return "inference", True, te.id
+        return "verified", False, te.id
+
+    return "unverified", False, None
+
+
+def _verify_schema_telemetry(
+    ev_input: AgentEvidenceInput,
+    src_norm: str,
+    te: ToolExecution,
+    out_data: Dict[str, Any]
+) -> Tuple[str, bool, Optional[str]]:
+    """
+    Verifies schema inspection evidence binding columns to their actual
+    missing, added, renamed, or type-mismatched status in the schema diff.
+    """
+    obs_lower = ev_input.observation.lower()
+
+    differences = out_data.get("differences") if isinstance(out_data.get("differences"), dict) else out_data
+    target_schema = out_data.get("target_schema") if isinstance(out_data.get("target_schema"), dict) else {}
+    actual_schema = out_data.get("actual_schema")
+
+    missing_cols = {c.lower() for c in (differences.get("missing_columns") or out_data.get("missing_columns") or [])}
+    new_cols = {c.lower() for c in (differences.get("unexpected_columns") or out_data.get("new_columns") or [])}
+    drift_cols = {c.lower() for c in (out_data.get("drift_columns") or [])} | missing_cols | new_cols
+
+    type_mismatches = differences.get("type_mismatches") or out_data.get("type_mismatches") or []
+    type_mismatch_map: Dict[str, Dict[str, str]] = {}
+    for tm in type_mismatches:
+        if isinstance(tm, dict) and "column" in tm:
+            type_mismatch_map[str(tm["column"]).lower()] = {
+                "expected": str(tm.get("expected_dtype", "")).lower(),
+                "actual": str(tm.get("actual_dtype", "")).lower()
+            }
+        elif isinstance(tm, str):
+            type_mismatch_map[tm.lower()] = {}
+
+    renamed_candidates = differences.get("renamed_candidates") or []
+    renamed_pairs: List[Tuple[str, str]] = []
+    for rc in renamed_candidates:
+        if isinstance(rc, dict) and rc.get("original") and rc.get("current"):
+            renamed_pairs.append((str(rc["original"]).lower(), str(rc["current"]).lower()))
+
+    present_cols: Dict[str, str] = {}
+    if target_schema:
+        for c in target_schema.get("columns", []):
+            present_cols.setdefault(str(c).lower(), "")
+        if isinstance(target_schema.get("fields"), dict):
+            for c, fmeta in target_schema["fields"].items():
+                dtype_str = str(fmeta.get("dtype", "")).lower() if isinstance(fmeta, dict) else ""
+                present_cols[str(c).lower()] = dtype_str
+    if actual_schema:
+        if isinstance(actual_schema, dict):
+            for c, dtype_val in actual_schema.items():
+                present_cols[str(c).lower()] = str(dtype_val).lower()
+        elif isinstance(actual_schema, list):
+            for c in actual_schema:
+                present_cols.setdefault(str(c).lower(), "")
+
+    if not (missing_cols or new_cols or drift_cols or type_mismatch_map or renamed_pairs or present_cols):
+        return "unverified", False, None
+
+    all_cols = missing_cols | new_cols | drift_cols | set(type_mismatch_map.keys()) | set(present_cols.keys())
+    words_in_obs = set(re.findall(r'[a-zA-Z0-9_]+', obs_lower))
+    mentioned_cols = [c for c in all_cols if c in words_in_obs]
+
+    explicit_col = ev_input.column_name.lower() if ev_input.column_name else None
+    if explicit_col and mentioned_cols and explicit_col not in mentioned_cols:
+        return "unverified", False, None
+
+    claimed_col = mentioned_cols[0] if mentioned_cols else explicit_col
+    if not claimed_col:
+        return "unverified", False, None
+
+    is_missing_claim = any(kw in obs_lower for kw in ("missing", "dropped", "removed", "not found", "lacking", "omitted"))
+    is_type_claim = any(kw in obs_lower for kw in ("type mismatch", "wrong type", "incompatible type", "expected type", "cast error"))
+    is_rename_claim = any(kw in obs_lower for kw in ("renamed", "rename"))
+    is_new_claim = any(kw in obs_lower for kw in ("added", "new column", "unexpected column", "extra column"))
+
+    allowed_terms = {claimed_col} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+    matched = False
+    valid_schema_nums: set[str] = set()
+
+    if is_rename_claim and renamed_pairs:
+        for orig_c, curr_c in renamed_pairs:
+            if orig_c in words_in_obs and curr_c in words_in_obs:
+                allowed_terms.update({orig_c, curr_c, "renamed", "rename", "candidate"})
+                matched = True
+                break
+        if not matched:
+            return "unverified", False, None
+
+    elif is_missing_claim:
+        if claimed_col in present_cols and claimed_col not in missing_cols:
+            return "unverified", False, None
+        if claimed_col in missing_cols or claimed_col in drift_cols:
+            matched = True
+            valid_schema_nums.add(str(len(missing_cols)))
+        else:
+            return "unverified", False, None
+
+    elif is_type_claim:
+        if claimed_col in type_mismatch_map:
+            tm_info = type_mismatch_map[claimed_col]
+            expected_t = tm_info.get("expected", "")
+            actual_t = tm_info.get("actual", "")
+            known_dtypes = {"int64", "float64", "object", "bool", "datetime", "datetime64", "string", "str", "int", "float"}
+            mentioned_dtypes = words_in_obs & known_dtypes
+            expected_allowed = {t for t in (expected_t, actual_t) if t}
+            if mentioned_dtypes and expected_allowed and not mentioned_dtypes.issubset(expected_allowed):
+                return "unverified", False, None
+            if expected_t:
+                allowed_terms.add(expected_t)
+            if actual_t:
+                allowed_terms.add(actual_t)
+            matched = True
+            valid_schema_nums.add(str(len(type_mismatch_map)))
+        else:
+            return "unverified", False, None
+
+    elif is_new_claim:
+        if claimed_col in new_cols or claimed_col in drift_cols:
+            matched = True
+            valid_schema_nums.add(str(len(new_cols)))
+        else:
+            return "unverified", False, None
+
+    else:
+        if claimed_col in (missing_cols | new_cols | drift_cols | set(type_mismatch_map.keys())):
+            matched = True
+        elif claimed_col in present_cols and present_cols[claimed_col] and present_cols[claimed_col] in obs_lower:
+            allowed_terms.add(present_cols[claimed_col])
+            matched = True
+        else:
+            return "unverified", False, None
+
+    if matched:
+        claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
+        if claimed_numbers and any(num not in valid_schema_nums for num in claimed_numbers):
+            return "unverified", False, None
+        if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+            return "inference", True, te.id
+        allowed_terms.update(valid_schema_nums)
+        if _has_uncorroborated_words(obs_lower, allowed_terms):
+            return "inference", True, te.id
+        return "verified", False, te.id
+
+    return "unverified", False, None
 
 
 def resolve_frame_to_project_relative(
@@ -305,346 +1333,74 @@ def verify_evidence_against_telemetry(
         ]
 
     obs_lower = ev_input.observation.lower()
+    best_inference: Optional[Tuple[str, bool, Optional[str]]] = None
 
     for te in candidate_execs:
-        if not te or not te.output_result:
+        if not te or not te.output_result or not isinstance(te.output_result, dict):
             continue
 
         out_data = te.output_result
-        tool_name = getattr(te, "tool_name", "")
+        tool_name = (getattr(te, "tool_name", "") or "").strip()
 
-        # 4. Corroborate strictly by structured tool outputs
+        res: Tuple[str, bool, Optional[str]] = ("unverified", False, None)
 
-        # =====================================================================
-        # 1.2 EXCEPTION EVIDENCE & TRACEBACKS (analyze_logs)
-        # =====================================================================
-        if tool_name == "analyze_logs" or "tracebacks" in out_data or "fatal_error" in out_data:
-            frames: List[Dict[str, Any]] = []
-            if "tracebacks" in out_data and isinstance(out_data["tracebacks"], list):
-                for tb in out_data["tracebacks"]:
-                    frames.extend(tb.get("frames", []))
-            
-            exc_types: List[str] = []
-            exc_messages: List[str] = []
-            if "fatal_error" in out_data and out_data["fatal_error"]:
-                lf = out_data["fatal_error"].get("last_frame")
-                if lf:
-                    frames.append(lf)
-                if out_data["fatal_error"].get("exception_type"):
-                    exc_types.append(out_data["fatal_error"]["exception_type"])
-                if out_data["fatal_error"].get("message"):
-                    exc_messages.append(out_data["fatal_error"]["message"])
-            if "tracebacks" in out_data and isinstance(out_data["tracebacks"], list):
-                for tb in out_data["tracebacks"]:
-                    if tb.get("exception_type"):
-                        exc_types.append(tb["exception_type"])
-                    if tb.get("message"):
-                        exc_messages.append(tb["message"])
+        if tool_name == "analyze_logs" or (not tool_name and ("tracebacks" in out_data or "fatal_error" in out_data)):
+            res = _verify_log_telemetry(ev_input, src_norm, te, out_data, project_paths, workspace_dir=workspace_dir)
 
-            # Verify line number strictly on matching file using strict path resolution
-            line_matched = False
-            for fr in frames:
-                resolved_fr = resolve_frame_to_project_relative(fr.get("file", ""), project_paths, workspace_dir=workspace_dir)
-                if resolved_fr and resolved_fr == src_norm:
-                    if ev_input.line_number is None or fr.get("line") == ev_input.line_number:
-                        line_matched = True
-                        break
+        elif tool_name == "profile_dataset" or (
+            not tool_name and ("column_profiles" in out_data or "columns" in out_data or "anomalies" in out_data)
+        ):
+            res = _verify_dataset_telemetry(ev_input, src_norm, te, out_data)
 
-            if not line_matched:
-                continue
-
-            # Exception verification: generic words alone NEVER independently verify
-            generic_words = {"error", "missing", "failed", "invalid", "exception", "bug", "crash", "issue", "problem", "terminat"}
-            words_in_obs = set(re.findall(r'[a-zA-Z0-9_]{3,}', obs_lower))
-            non_generic_words = words_in_obs - generic_words
-
-            # 1. Check exception type corroboration
-            matched_exc_type = any(et.lower() in obs_lower for et in exc_types)
-            
-            # Check if observation asserts a conflicting exception type (e.g. claims ValueError when error is KeyError)
-            known_py_exceptions = {"keyerror", "valueerror", "typeerror", "filenotfounderror", "zerodivisionerror", "indexerror", "attributeerror", "importerror"}
-            mentioned_known_exceptions = words_in_obs & known_py_exceptions
-            if mentioned_known_exceptions:
-                actual_exc_types_lower = {et.lower() for et in exc_types}
-                if not (mentioned_known_exceptions & actual_exc_types_lower):
-                    # Conflicting exception type asserted!
-                    return "unverified", False, None
-
-            # 2. Check specific message corroboration (distinct tokens, column names, values)
-            matched_exc_msg = False
-            for msg in exc_messages:
-                msg_tokens = [
-                    w.lower() for w in re.findall(r'[a-zA-Z0-9_]{3,}', msg)
-                    if w.lower() not in generic_words
-                ]
-                if any(tok in obs_lower for tok in msg_tokens):
-                    matched_exc_msg = True
-                    break
-
-            gt_tokens = extract_all_telemetry_tokens(out_data)
-            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
-            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
-
-            # Both exception type OR specific error token must be present, plus non-generic content
-            if (matched_exc_type or matched_exc_msg) and non_generic_words:
-                if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "prevents", "sanitizes", "filters", "drops", "bypasses")) or has_unsupported_assertions:
-                    return "inference", True, te.id
-                return "verified", False, te.id
-            else:
-                # Uncorroborated by exception type or error tokens
-                return "unverified", False, None
-
-        # =====================================================================
-        # 1.3 DATASET PROFILING EVIDENCE (profile_dataset)
-        # =====================================================================
-        elif tool_name == "profile_dataset" or "anomalies" in out_data:
-            anomalies = out_data.get("anomalies", [])
-            columns_data = out_data.get("columns", {}) if isinstance(out_data.get("columns"), dict) else {}
-            dataset_stats = out_data.get("dataset", {}) if isinstance(out_data.get("dataset"), dict) else {}
-            col_name = ev_input.column_name or ""
-            col_lower = col_name.lower()
-
-            col_profile = columns_data.get(col_name, {}) if col_name else {}
-            matching_anomalies = [
-                a for a in anomalies
-                if isinstance(a, dict) and a.get("column", "").lower() == col_lower
-            ] if col_lower else []
-
-            # Identify specific claim type
-            is_null_claim = any(kw in obs_lower for kw in ("null", "nan", "missing value", "empty value"))
-            is_dup_claim = any(kw in obs_lower for kw in ("duplicate", "repeated row", "repeated record"))
-            is_row_count_claim = any(kw in obs_lower for kw in ("row count", "total rows", "records loaded", "rows in dataset"))
-            is_type_claim = any(kw in obs_lower for kw in ("data type", "datatype", "type is", "dtype", "inferred type"))
-
-            claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
-
-            gt_tokens = extract_all_telemetry_tokens(out_data)
-            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
-            if col_name:
-                gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', col_name.lower()))
-            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
-
-            if is_null_claim and col_lower:
-                actual_null_count = col_profile.get("null_count", 0)
-                anomaly_null_count = sum(a.get("null_count", 0) for a in matching_anomalies if "null" in str(a.get("type", "")).lower())
-                recorded_nulls = max(actual_null_count, anomaly_null_count)
-
-                if recorded_nulls == 0:
-                    # Column has 0 nulls, claim that it has nulls is rejected!
-                    return "unverified", False, None
-
-                # If specific number claimed, must match recorded null count or null percentage
-                if claimed_numbers:
-                    recorded_nums = {
-                        str(recorded_nulls),
-                        f"{col_profile.get('null_percentage', -1):.1f}%",
-                        f"{col_profile.get('null_percentage', -1):.0f}%",
-                        str(col_profile.get('null_percentage', -1))
-                    }
-                    if not any(num in recorded_nums for num in claimed_numbers):
-                        return "unverified", False, None  # Invented statistic
-
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
-                    return "inference", True, te.id
-                return "verified", False, te.id
-
-            elif is_dup_claim:
-                recorded_dups = dataset_stats.get("duplicate_rows", 0)
-                if recorded_dups == 0:
-                    return "unverified", False, None
-                if claimed_numbers and not any(str(recorded_dups) == num for num in claimed_numbers):
-                    return "unverified", False, None
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
-                    return "inference", True, te.id
-                return "verified", False, te.id
-
-            elif is_row_count_claim:
-                recorded_rows = dataset_stats.get("total_rows", 0)
-                if claimed_numbers and not any(str(recorded_rows) == num for num in claimed_numbers):
-                    return "unverified", False, None
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
-                    return "inference", True, te.id
-                return "verified", False, te.id
-
-            elif is_type_claim and col_lower:
-                recorded_type = str(col_profile.get("dtype") or col_profile.get("inferred_type", "")).lower()
-                if recorded_type and recorded_type in obs_lower:
-                    if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
-                        return "inference", True, te.id
-                    return "verified", False, te.id
-                return "unverified", False, None
-
-            elif matching_anomalies:
-                # Anomaly claim for this column
-                telemetry_str = json.dumps(matching_anomalies) + " " + json.dumps(col_profile)
-                if claimed_numbers:
-                    if not all(num.rstrip('%') in telemetry_str for num in claimed_numbers):
-                        return "unverified", False, None
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
-                    return "inference", True, te.id
-                return "verified", False, te.id
-
-            else:
-                # Unrelated semantic claim not proven by dataset profile
-                return "inference", True, te.id
-
-        # =====================================================================
-        # 1.4 AST & CODE INSPECTION EVIDENCE (inspect_code)
-        # =====================================================================
-        elif tool_name == "inspect_code" or "functions" in out_data:
-            fns = out_data.get("functions", [])
-            classes = out_data.get("classes", [])
-            imports = out_data.get("imports", [])
-
-            fn_dict = {f.get("name", "").lower(): f for f in fns if isinstance(f, dict) and f.get("name")}
-            class_dict = {c.get("name", "").lower(): c for c in classes if isinstance(c, dict) and c.get("name")}
-            import_names = {str(imp).lower() for imp in imports}
-
-            gt_tokens = extract_all_telemetry_tokens(out_data)
-            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
-            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
-
-            # Runtime behavioral, causal, or uncorroborated assertions that CANNOT be established by AST syntax alone
-            is_behavioral_claim = contains_behavioral_claim(obs_lower) or contains_causal_explanation(obs_lower) or has_unsupported_assertions
-
-            line_matched = False
-            if ev_input.line_number is not None:
-                for fn in fns:
-                    if fn.get("lineno") == ev_input.line_number or fn.get("end_lineno") == ev_input.line_number:
-                        line_matched = True
-                        break
-                for cl in classes:
-                    if cl.get("lineno") == ev_input.line_number:
-                        line_matched = True
-                        break
-
-            # Syntactic facts: function existence, signature, class, or imports
-            claimed_fn = any(fn in obs_lower for fn in fn_dict.keys() if len(fn) > 2)
-            claimed_cls = any(cl in obs_lower for cl in class_dict.keys() if len(cl) > 2)
-            claimed_import = any(imp in obs_lower for imp in import_names if len(imp) > 2)
-
-            if (claimed_fn or claimed_cls or claimed_import) and (ev_input.line_number is None or line_matched):
-                if is_behavioral_claim:
-                    # Do NOT infer runtime behavior or causality from syntax alone!
-                    return "inference", True, te.id
-                return "verified", False, te.id
-
-        # =====================================================================
-        # 1.5 DEPENDENCY EVIDENCE (trace_dependencies)
-        # =====================================================================
-        elif tool_name == "trace_dependencies":
-            direct_deps = {str(d).lower() for d in out_data.get("dependencies", [])}
-            reverse_deps = {str(d).lower() for d in (out_data.get("reverse_dependencies") or out_data.get("dependents") or [])}
-            imports = {str(imp).lower() for imp in out_data.get("imports", [])}
-            packages = {str(pkg).lower() for pkg in out_data.get("packages", [])}
-
-            gt_tokens = extract_all_telemetry_tokens(out_data)
-            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
-            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
-
-            is_direct_claim = bool(
-                re.search(r'\bdepends\b(?:\s+\w+)?\s+on\b', obs_lower)
-                or any(kw in obs_lower for kw in ("requires", "upstream dependency", "direct dependency"))
+        elif tool_name == "inspect_code" or (
+            not tool_name and ("functions" in out_data or "data_loadings" in out_data or "column_references" in out_data)
+        ):
+            res = _verify_code_ast_telemetry(
+                ev_input, src_norm, te, out_data, project_paths=project_paths, workspace_dir=workspace_dir
             )
-            is_reverse_claim = any(kw in obs_lower for kw in ("is used by", "depended on by", "downstream consumer", "reverse dependency"))
-            is_import_claim = any(kw in obs_lower for kw in ("imports", "imported from", "import statement"))
-            is_package_claim = any(kw in obs_lower for kw in ("declares package", "dependency package", "installed package", "package requirement"))
 
-            if is_direct_claim:
-                if any(dep in obs_lower for dep in direct_deps if len(dep) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
-                        return "inference", True, te.id
-                    return "verified", False, te.id
-                elif any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
-                    # Reverse dependency mistakenly claimed as direct dependency!
-                    return "unverified", False, None
+        elif tool_name == "trace_dependencies" or (
+            not tool_name and ("stages" in out_data or "edges" in out_data or "dependencies" in out_data)
+        ):
+            res = _verify_dependency_telemetry(ev_input, src_norm, te, out_data)
 
-            elif is_reverse_claim:
-                if any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
-                        return "inference", True, te.id
-                    return "verified", False, te.id
+        elif tool_name == "inspect_schema" or (
+            not tool_name and (
+                "differences" in out_data or "target_schema" in out_data
+                or "drift_columns" in out_data or "actual_schema" in out_data
+            )
+        ):
+            res = _verify_schema_telemetry(ev_input, src_norm, te, out_data)
 
-            elif is_import_claim:
-                if any(imp in obs_lower for imp in imports if len(imp) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
-                        return "inference", True, te.id
-                    return "verified", False, te.id
-
-            elif is_package_claim:
-                if any(pkg in obs_lower for pkg in packages if len(pkg) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
-                        return "inference", True, te.id
-                    return "verified", False, te.id
-
-            else:
-                all_known = direct_deps | reverse_deps | imports | packages
-                if any(k in obs_lower for k in all_known if len(k) > 2):
-                    return "inference", True, te.id
-
-        # =====================================================================
-        # SCHEMA DRIFT (inspect_schema)
-        # =====================================================================
-        elif tool_name == "inspect_schema" or "drift_columns" in out_data or "actual_schema" in out_data:
-            drift_cols = {c.lower() for c in out_data.get("drift_columns", [])}
-            missing_cols = {c.lower() for c in out_data.get("missing_columns", [])}
-            new_cols = {c.lower() for c in out_data.get("new_columns", [])}
-            type_mismatches = out_data.get("type_mismatches", [])
-            type_mismatch_cols = set()
-            for tm in type_mismatches:
-                if isinstance(tm, dict) and "column" in tm:
-                    type_mismatch_cols.add(tm["column"].lower())
-                elif isinstance(tm, str):
-                    type_mismatch_cols.add(tm.lower())
-
-            col_lower = ev_input.column_name.lower() if ev_input.column_name else ""
-            gt_tokens = extract_all_telemetry_tokens(out_data)
-            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
-            if col_lower:
-                gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', col_lower.lower()))
-            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
-
-            if col_lower:
-                is_missing_claim = any(kw in obs_lower for kw in ("missing", "dropped", "removed", "not found", "lacking", "omitted"))
-                is_type_claim = any(kw in obs_lower for kw in ("type mismatch", "wrong type", "incompatible type", "expected type", "cast error"))
-                is_new_claim = any(kw in obs_lower for kw in ("added", "new column", "unexpected column", "renamed to", "extra column"))
-
-                if is_missing_claim:
-                    if col_lower in missing_cols or col_lower in drift_cols:
-                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
-                            return "inference", True, te.id
-                        return "verified", False, te.id
-                    else:
-                        return "unverified", False, None
-                elif is_type_claim:
-                    if col_lower in type_mismatch_cols:
-                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
-                            return "inference", True, te.id
-                        return "verified", False, te.id
-                    else:
-                        return "unverified", False, None
-                elif is_new_claim:
-                    if col_lower in new_cols or col_lower in drift_cols:
-                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
-                            return "inference", True, te.id
-                        return "verified", False, te.id
-                    else:
-                        return "unverified", False, None
-
-        # =====================================================================
-        # HYPOTHESIS TESTING (test_hypothesis)
-        # =====================================================================
         elif tool_name == "test_hypothesis":
             result_data = out_data.get("result", {}) if isinstance(out_data.get("result"), dict) else out_data
-            supported = result_data.get("supported") or out_data.get("supported")
-            if supported is True and any(kw in obs_lower for kw in ("support", "confirm", "pass", "valid")):
-                if contains_causal_explanation(obs_lower):
-                    return "inference", True, te.id
-                return "verified", False, te.id
-            elif supported is False and any(kw in obs_lower for kw in ("contradict", "reject", "fail", "refut")):
-                if contains_causal_explanation(obs_lower):
-                    return "inference", True, te.id
-                return "verified", False, te.id
+            supported = result_data.get("supported") if "supported" in result_data else out_data.get("supported")
+            conclusion = str(result_data.get("conclusion") or out_data.get("conclusion") or "").lower()
+            hyp_id = str(result_data.get("hypothesis_id") or out_data.get("hypothesis_id") or "").lower()
+            allowed_terms = set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+            if hyp_id:
+                allowed_terms.add(hyp_id)
+
+            if (supported is True or conclusion == "confirmed") and any(kw in obs_lower for kw in ("support", "confirm", "pass", "valid")):
+                allowed_terms.update({"confirm", "confirmed", "support", "supported", "supports", "pass", "valid"})
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or _has_uncorroborated_words(obs_lower, allowed_terms):
+                    res = ("inference", True, te.id)
+                else:
+                    res = ("verified", False, te.id)
+            elif (supported is False or conclusion == "rejected") and any(kw in obs_lower for kw in ("contradict", "reject", "fail", "refut")):
+                allowed_terms.update({"contradict", "contradicted", "reject", "rejected", "refute", "refuted"})
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or _has_uncorroborated_words(obs_lower, allowed_terms):
+                    res = ("inference", True, te.id)
+                else:
+                    res = ("verified", False, te.id)
+
+        if res[0] == "verified":
+            return res
+        if res[0] == "inference" and best_inference is None:
+            best_inference = res
+
+    if best_inference is not None:
+        return best_inference
 
     return "unverified", False, None
 
