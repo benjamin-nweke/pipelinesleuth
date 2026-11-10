@@ -73,6 +73,27 @@ BEHAVIORAL_KEYWORDS = frozenset({
     "handle", "handles", "handling"
 })
 
+COMMON_OBSERVATIONAL_TERMS = frozenset({
+    "the", "a", "an", "in", "on", "at", "to", "for", "of", "with", "by", "from",
+    "is", "was", "are", "were", "be", "been", "being", "have", "has", "had", "do",
+    "does", "did", "and", "or", "but", "if", "then", "else", "when", "where", "which",
+    "that", "this", "these", "those", "it", "its", "as", "into", "during", "after", "before",
+    "file", "files", "path", "line", "lines", "lineno", "code", "source", "module", "script",
+    "raised", "threw", "thrown", "occurred", "found", "detected", "observed", "reported",
+    "shows", "recorded", "indicates", "contains", "column", "columns", "row", "rows",
+    "dataset", "data", "dataframe", "df", "table", "field", "fields", "value", "values",
+    "record", "records", "count", "total", "percentage", "type", "dtype", "inferred",
+    "null", "nulls", "nan", "missing", "duplicate", "duplicates", "empty",
+    "function", "functions", "class", "classes", "method", "methods", "def", "import", "imports",
+    "package", "packages", "dependency", "dependencies", "depends", "depended", "requires", "required",
+    "traceback", "stacktrace", "frame", "frames", "error", "errors", "exception", "exceptions",
+    "failure", "fail", "failed", "fatal", "log", "logs", "output", "result", "results",
+    "status", "test", "tests", "check", "checks", "syntax", "ast", "inspect", "profile",
+    "pipeline", "number", "actual", "expected", "present", "defined", "definition", "call", "calls",
+    "drift", "schema", "diff", "added", "dropped", "removed", "new", "incompatible", "mismatch",
+    "directly", "upstream", "downstream"
+})
+
 
 def contains_causal_explanation(text: str) -> bool:
     """Returns True if the text asserts an explanatory or causal relationship."""
@@ -84,6 +105,41 @@ def contains_behavioral_claim(text: str) -> bool:
     """Returns True if the text asserts runtime behavior, filtering, mutation, or handling actions."""
     words = set(re.findall(r'[a-zA-Z0-9_]+', text.lower()))
     return bool(words & BEHAVIORAL_KEYWORDS)
+
+
+def extract_all_telemetry_tokens(output_result: Any) -> set[str]:
+    """Recursively extracts all lowercase alphanumeric tokens from structured tool output."""
+    tokens = set()
+    def _recurse(val: Any):
+        if isinstance(val, str):
+            tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', val.lower()))
+        elif isinstance(val, (int, float, bool)):
+            tokens.add(str(val).lower())
+        elif isinstance(val, dict):
+            for k, v in val.items():
+                if isinstance(k, str):
+                    tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', k.lower()))
+                _recurse(v)
+        elif isinstance(val, (list, tuple, set)):
+            for item in val:
+                _recurse(item)
+    _recurse(output_result)
+    return tokens
+
+
+def check_observation_unsupported_assertions(
+    obs_lower: str,
+    ground_truth_tokens: set[str]
+) -> bool:
+    """
+    Rigorously checks whether the observation contains substantive factual claims
+    that have NO corresponding structured evidence in the tool output.
+    Returns True if the observation contains uncorroborated substantive assertions (mixed claim).
+    """
+    words_in_obs = set(re.findall(r'[a-zA-Z0-9_]{3,}', obs_lower))
+    substantive_words = {w for w in words_in_obs if w not in COMMON_OBSERVATIONAL_TERMS}
+    unsupported = {w for w in substantive_words if w not in ground_truth_tokens}
+    return bool(unsupported)
 
 
 def resolve_frame_to_project_relative(
@@ -325,9 +381,13 @@ def verify_evidence_against_telemetry(
                     matched_exc_msg = True
                     break
 
+            gt_tokens = extract_all_telemetry_tokens(out_data)
+            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
+
             # Both exception type OR specific error token must be present, plus non-generic content
             if (matched_exc_type or matched_exc_msg) and non_generic_words:
-                if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "prevents", "sanitizes", "filters", "drops", "bypasses")):
+                if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "prevents", "sanitizes", "filters", "drops", "bypasses")) or has_unsupported_assertions:
                     return "inference", True, te.id
                 return "verified", False, te.id
             else:
@@ -358,6 +418,12 @@ def verify_evidence_against_telemetry(
 
             claimed_numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', obs_lower)
 
+            gt_tokens = extract_all_telemetry_tokens(out_data)
+            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+            if col_name:
+                gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', col_name.lower()))
+            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
+
             if is_null_claim and col_lower:
                 actual_null_count = col_profile.get("null_count", 0)
                 anomaly_null_count = sum(a.get("null_count", 0) for a in matching_anomalies if "null" in str(a.get("type", "")).lower())
@@ -378,7 +444,7 @@ def verify_evidence_against_telemetry(
                     if not any(num in recorded_nums for num in claimed_numbers):
                         return "unverified", False, None  # Invented statistic
 
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
                     return "inference", True, te.id
                 return "verified", False, te.id
 
@@ -388,7 +454,7 @@ def verify_evidence_against_telemetry(
                     return "unverified", False, None
                 if claimed_numbers and not any(str(recorded_dups) == num for num in claimed_numbers):
                     return "unverified", False, None
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
                     return "inference", True, te.id
                 return "verified", False, te.id
 
@@ -396,14 +462,14 @@ def verify_evidence_against_telemetry(
                 recorded_rows = dataset_stats.get("total_rows", 0)
                 if claimed_numbers and not any(str(recorded_rows) == num for num in claimed_numbers):
                     return "unverified", False, None
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
                     return "inference", True, te.id
                 return "verified", False, te.id
 
             elif is_type_claim and col_lower:
                 recorded_type = str(col_profile.get("dtype") or col_profile.get("inferred_type", "")).lower()
                 if recorded_type and recorded_type in obs_lower:
-                    if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                    if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
                         return "inference", True, te.id
                     return "verified", False, te.id
                 return "unverified", False, None
@@ -414,7 +480,7 @@ def verify_evidence_against_telemetry(
                 if claimed_numbers:
                     if not all(num.rstrip('%') in telemetry_str for num in claimed_numbers):
                         return "unverified", False, None
-                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower):
+                if contains_causal_explanation(obs_lower) or contains_behavioral_claim(obs_lower) or has_unsupported_assertions:
                     return "inference", True, te.id
                 return "verified", False, te.id
 
@@ -434,11 +500,12 @@ def verify_evidence_against_telemetry(
             class_dict = {c.get("name", "").lower(): c for c in classes if isinstance(c, dict) and c.get("name")}
             import_names = {str(imp).lower() for imp in imports}
 
-            # Runtime behavioral or causal keywords that CANNOT be established by AST syntax alone
-            is_behavioral_claim = contains_behavioral_claim(obs_lower) or contains_causal_explanation(obs_lower)
-            if is_behavioral_claim:
-                # Do NOT infer runtime behavior or causality from syntax alone!
-                return "inference", True, te.id
+            gt_tokens = extract_all_telemetry_tokens(out_data)
+            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
+
+            # Runtime behavioral, causal, or uncorroborated assertions that CANNOT be established by AST syntax alone
+            is_behavioral_claim = contains_behavioral_claim(obs_lower) or contains_causal_explanation(obs_lower) or has_unsupported_assertions
 
             line_matched = False
             if ev_input.line_number is not None:
@@ -457,6 +524,9 @@ def verify_evidence_against_telemetry(
             claimed_import = any(imp in obs_lower for imp in import_names if len(imp) > 2)
 
             if (claimed_fn or claimed_cls or claimed_import) and (ev_input.line_number is None or line_matched):
+                if is_behavioral_claim:
+                    # Do NOT infer runtime behavior or causality from syntax alone!
+                    return "inference", True, te.id
                 return "verified", False, te.id
 
         # =====================================================================
@@ -468,6 +538,10 @@ def verify_evidence_against_telemetry(
             imports = {str(imp).lower() for imp in out_data.get("imports", [])}
             packages = {str(pkg).lower() for pkg in out_data.get("packages", [])}
 
+            gt_tokens = extract_all_telemetry_tokens(out_data)
+            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
+
             is_direct_claim = bool(
                 re.search(r'\bdepends\b(?:\s+\w+)?\s+on\b', obs_lower)
                 or any(kw in obs_lower for kw in ("requires", "upstream dependency", "direct dependency"))
@@ -478,7 +552,7 @@ def verify_evidence_against_telemetry(
 
             if is_direct_claim:
                 if any(dep in obs_lower for dep in direct_deps if len(dep) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
                         return "inference", True, te.id
                     return "verified", False, te.id
                 elif any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
@@ -487,19 +561,19 @@ def verify_evidence_against_telemetry(
 
             elif is_reverse_claim:
                 if any(dep in obs_lower for dep in reverse_deps if len(dep) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
                         return "inference", True, te.id
                     return "verified", False, te.id
 
             elif is_import_claim:
                 if any(imp in obs_lower for imp in imports if len(imp) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
                         return "inference", True, te.id
                     return "verified", False, te.id
 
             elif is_package_claim:
                 if any(pkg in obs_lower for pkg in packages if len(pkg) > 2):
-                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                    if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
                         return "inference", True, te.id
                     return "verified", False, te.id
 
@@ -524,6 +598,12 @@ def verify_evidence_against_telemetry(
                     type_mismatch_cols.add(tm.lower())
 
             col_lower = ev_input.column_name.lower() if ev_input.column_name else ""
+            gt_tokens = extract_all_telemetry_tokens(out_data)
+            gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
+            if col_lower:
+                gt_tokens.update(re.findall(r'[a-zA-Z0-9_]{2,}', col_lower.lower()))
+            has_unsupported_assertions = check_observation_unsupported_assertions(obs_lower, gt_tokens)
+
             if col_lower:
                 is_missing_claim = any(kw in obs_lower for kw in ("missing", "dropped", "removed", "not found", "lacking", "omitted"))
                 is_type_claim = any(kw in obs_lower for kw in ("type mismatch", "wrong type", "incompatible type", "expected type", "cast error"))
@@ -531,21 +611,21 @@ def verify_evidence_against_telemetry(
 
                 if is_missing_claim:
                     if col_lower in missing_cols or col_lower in drift_cols:
-                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
                             return "inference", True, te.id
                         return "verified", False, te.id
                     else:
                         return "unverified", False, None
                 elif is_type_claim:
                     if col_lower in type_mismatch_cols:
-                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
                             return "inference", True, te.id
                         return "verified", False, te.id
                     else:
                         return "unverified", False, None
                 elif is_new_claim:
                     if col_lower in new_cols or col_lower in drift_cols:
-                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")):
+                        if contains_causal_explanation(obs_lower) or any(bw in obs_lower for bw in ("removes", "detects", "sanitizes")) or has_unsupported_assertions:
                             return "inference", True, te.id
                         return "verified", False, te.id
                     else:

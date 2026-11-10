@@ -164,14 +164,19 @@ PipelineSleuth includes three reproducible failure scenarios ready for one-click
 
 ## Running Automated Tests
 
-Run the full pytest suite (96 unit, security remediation, CAS lease concurrency, OS-process contention, persistence, API, and E2E integration tests):
+Run the full pytest suite spanning unit, security remediation, CAS lease concurrency, OS-process contention, persistence, API, and E2E integration tests:
 ```bash
 ./scripts/run_tests.sh
 ```
 
-Or directly:
+Or directly via pytest:
 ```bash
 PYTHONPATH=. .venv/bin/pytest backend/tests -v
+```
+
+To inspect the live collected test count dynamically at any time without running the tests:
+```bash
+PYTHONPATH=. .venv/bin/pytest backend/tests --collect-only -q
 ```
 
 ### Security & Verification Test Suite Highlights

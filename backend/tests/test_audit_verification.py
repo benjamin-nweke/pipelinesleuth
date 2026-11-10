@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from backend.app.core.config import settings
@@ -1318,5 +1318,825 @@ def test_sqlite_metadata_distinguishes_index_configurations():
     con.execute("CREATE UNIQUE INDEX uq_validation_runs_patch_id ON validation_runs (patch_id)")
     assert check_validation_runs_unique_index(wrapper) is True
     con.close()
+
+
+# ============================================================================
+# 9. FINAL AUDIT FOLLOW-UP REGRESSION SUITE (POINTS 1 TO 5)
+# ============================================================================
+
+# --- Point 1: NULL lease recovery race ---
+
+@pytest.mark.asyncio
+async def test_cas_recovery_null_expiry_concurrent_renewal(db_session: AsyncSession):
+    """
+    When original lease expiry is NULL, CAS requires validation_lease_expires_at IS NULL.
+    If another worker concurrently renews/assigns a lease expiry, recovery CAS matches 0 rows and is rejected.
+    """
+    proj = Project(name="Null Expiry Test Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now - timedelta(seconds=600),
+        validation_lease_expires_at=None,
+        validation_claimed_by="worker_1",
+        validation_claim_token="claim_tok_null_exp"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Worker B concurrently renews the lease, setting non-null expiry:
+    patch.validation_lease_expires_at = now + timedelta(seconds=300)
+    await db_session.commit()
+
+    # Worker A's recovery CAS update with expected_expires_at IS NULL must fail
+    stmt = (
+        update(PatchProposal)
+        .where(
+            PatchProposal.id == patch.id,
+            PatchProposal.investigation_id == inv.id,
+            PatchProposal.status == "validating",
+            PatchProposal.validation_claim_token == "claim_tok_null_exp",
+            PatchProposal.validation_lease_expires_at.is_(None)
+        )
+        .values(status="approved")
+    )
+    res = await db_session.execute(stmt)
+    await db_session.commit()
+    assert res.rowcount == 0
+
+
+@pytest.mark.asyncio
+async def test_cas_recovery_null_token_concurrent_assignment(db_session: AsyncSession):
+    """
+    When original claim token is NULL, CAS requires validation_claim_token IS NULL.
+    If another worker assigns a token concurrently, CAS update fails.
+    """
+    proj = Project(name="Null Token Test Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now - timedelta(seconds=600),
+        validation_lease_expires_at=None,
+        validation_claimed_by=None,
+        validation_claim_token=None
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Another worker sets a claim token concurrently
+    patch.validation_claim_token = "new_assigned_token"
+    await db_session.commit()
+
+    # Stale recovery expecting null token attempts recovery
+    stmt = (
+        update(PatchProposal)
+        .where(
+            PatchProposal.id == patch.id,
+            PatchProposal.investigation_id == inv.id,
+            PatchProposal.status == "validating",
+            PatchProposal.validation_claim_token.is_(None),
+            PatchProposal.validation_lease_expires_at.is_(None)
+        )
+        .values(status="approved")
+    )
+    res = await db_session.execute(stmt)
+    await db_session.commit()
+    assert res.rowcount == 0
+
+
+@pytest.mark.asyncio
+async def test_cas_recovery_non_null_token_and_expiry_changing_fails(db_session: AsyncSession):
+    """
+    When original expiry and token are non-null, changing either before update causes CAS to fail.
+    """
+    proj = Project(name="Expiry Token Change Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    orig_expiry = now - timedelta(seconds=30)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now - timedelta(seconds=600),
+        validation_lease_expires_at=orig_expiry,
+        validation_claimed_by="worker_1",
+        validation_claim_token="orig_token"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Token changes concurrently (e.g. re-claimed)
+    patch.validation_claim_token = "new_token_changed"
+    await db_session.commit()
+
+    # Attempt recovery with stale expected token and expiry
+    stmt = (
+        update(PatchProposal)
+        .where(
+            PatchProposal.id == patch.id,
+            PatchProposal.investigation_id == inv.id,
+            PatchProposal.status == "validating",
+            PatchProposal.validation_claim_token == "orig_token",
+            PatchProposal.validation_lease_expires_at == orig_expiry,
+            PatchProposal.validation_lease_expires_at <= now
+        )
+        .values(status="approved")
+    )
+    res = await db_session.execute(stmt)
+    await db_session.commit()
+    assert res.rowcount == 0
+
+
+@pytest.mark.asyncio
+async def test_cas_recovery_two_recovery_attempts_against_same_claim(db_session: AsyncSession):
+    """Two sequential or concurrent recovery calls against the same expired claim: first succeeds, second is rejected."""
+    proj = Project(name="Two Recovery Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now - timedelta(seconds=600),
+        validation_lease_expires_at=now - timedelta(seconds=10),
+        validation_claimed_by="worker_1",
+        validation_claim_token="two_rec_tok"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Recovery 1 succeeds
+    recovered = await privileged_validation_service.recover_abandoned_validation(
+        db=db_session,
+        investigation_id=inv.id,
+        patch_id=patch.id
+    )
+    assert recovered.status == "approved"
+    assert recovered.validation_claim_token is None
+
+    # Recovery 2 must fail because status is now "approved", not "validating"
+    with pytest.raises(ValueError, match="not in 'validating' state"):
+        await privileged_validation_service.recover_abandoned_validation(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id
+        )
+
+
+# --- Point 2: Prevent expired lease renewal ---
+
+@pytest.mark.asyncio
+async def test_lease_renewal_before_expiry_succeeds(db_session: AsyncSession):
+    """Lease renewal by the legitimate owner before expiration succeeds."""
+    proj = Project(name="Renewal Success Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now,
+        validation_lease_expires_at=now + timedelta(seconds=60),
+        validation_claimed_by="worker_active",
+        validation_claim_token="valid_active_token"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    renewed = await privileged_validation_service.renew_validation_lease(
+        db=db_session,
+        investigation_id=inv.id,
+        patch_id=patch.id,
+        claim_token="valid_active_token",
+        extend_seconds=120
+    )
+    exp = renewed.validation_lease_expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    assert exp > now + timedelta(seconds=60)
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_after_expiry_fails(db_session: AsyncSession):
+    """Lease renewal after the lease has already expired is strictly rejected."""
+    proj = Project(name="Renewal Expired Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now - timedelta(seconds=200),
+        validation_lease_expires_at=now - timedelta(seconds=10),
+        validation_claimed_by="worker_late",
+        validation_claim_token="late_token"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="expired.*Expired leases cannot be revived"):
+        await privileged_validation_service.renew_validation_lease(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            claim_token="late_token",
+            extend_seconds=60
+        )
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_after_recovery_fails(db_session: AsyncSession):
+    """A worker attempting renewal after recovery has reset the patch is rejected."""
+    proj = Project(name="Renewal After Recovery Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="approved",  # Already recovered
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=None,
+        validation_lease_expires_at=None,
+        validation_claimed_by=None,
+        validation_claim_token=None
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="has no active lease expiry and cannot be renewed"):
+        await privileged_validation_service.renew_validation_lease(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            claim_token="old_worker_token",
+            extend_seconds=60
+        )
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_with_stale_token_fails(db_session: AsyncSession):
+    """Lease renewal with wrong or stale token is rejected."""
+    proj = Project(name="Stale Token Renewal Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now,
+        validation_lease_expires_at=now + timedelta(seconds=120),
+        validation_claimed_by="worker_1",
+        validation_claim_token="token_correct"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="claim token is invalid"):
+        await privileged_validation_service.renew_validation_lease(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            claim_token="stale_or_wrong_token",
+            extend_seconds=60
+        )
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_racing_with_recovery_has_single_winner(db_session: AsyncSession):
+    """
+    Renewal requires validation_lease_expires_at > :now.
+    Recovery requires validation_lease_expires_at <= :now.
+    Because these predicates are mutually exclusive, a race yields exactly one valid outcome.
+    """
+    proj = Project(name="Race Winner Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    # Case: Lease is expired. Recovery wins, renewal loses.
+    patch_expired = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now - timedelta(seconds=200),
+        validation_lease_expires_at=now - timedelta(seconds=5),
+        validation_claimed_by="worker_race",
+        validation_claim_token="race_tok_exp"
+    )
+    db_session.add(patch_expired)
+    await db_session.commit()
+
+    # Recovery succeeds
+    rec = await privileged_validation_service.recover_abandoned_validation(
+        db_session, inv.id, patch_expired.id
+    )
+    assert rec.status == "approved"
+
+    # Renewal fails
+    with pytest.raises(ValueError):
+        await privileged_validation_service.renew_validation_lease(
+            db_session, inv.id, patch_expired.id, claim_token="race_tok_exp", extend_seconds=60
+        )
+
+
+# --- Point 3: Enforce authorization inside administrative recovery ---
+
+@pytest.mark.asyncio
+async def test_force_recover_unauthorized_principals_denied_and_audited(db_session: AsyncSession):
+    """Unauthorized principals (viewer, operator, missing admin scope) cannot force recover, and denials are audited."""
+    proj = Project(name="Force Recover Auth Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now,
+        validation_lease_expires_at=now + timedelta(seconds=60),
+        validation_claimed_by="worker_1",
+        validation_claim_token="tok_admin_test"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # 1. Non-principal / None
+    with pytest.raises(PermissionError, match="requires a verified AuthenticatedPrincipal"):
+        await privileged_validation_service.force_recover_validation_claim(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            operator=None
+        )
+
+    # 2. Viewer role
+    viewer = AuthenticatedPrincipal(principal_id="viewer_bob", role="viewer", scopes=["read"])
+    with pytest.raises(PermissionError, match="strictly requires role 'admin'"):
+        await privileged_validation_service.force_recover_validation_claim(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            operator=viewer
+        )
+
+    # 3. Operator role (not admin)
+    operator = AuthenticatedPrincipal(principal_id="op_alice", role="operator", scopes=["patch:approve", "patch:reject"])
+    with pytest.raises(PermissionError, match="strictly requires role 'admin'"):
+        await privileged_validation_service.force_recover_validation_claim(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            operator=operator
+        )
+
+    # 4. Admin without recovery scope
+    admin_no_scope = AuthenticatedPrincipal(principal_id="admin_dave", role="admin", scopes=["audit:read"])
+    with pytest.raises(PermissionError, match="lacks administrative recovery scope"):
+        await privileged_validation_service.force_recover_validation_claim(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch.id,
+            operator=admin_no_scope
+        )
+
+    # Verify audit log recorded denied attempts with caller identity
+    audit_log = privileged_validation_service.get_audit_log(patch_id=patch.id)
+    denied_entries = [e for e in audit_log if e.get("status") == "admin_recovery_denied"]
+    assert len(denied_entries) >= 4
+    denied_principals = {e.get("authorized_by") for e in denied_entries}
+    assert "viewer_bob" in denied_principals
+    assert "op_alice" in denied_principals
+    assert "admin_dave" in denied_principals
+
+
+@pytest.mark.asyncio
+async def test_force_recover_authorized_admin_succeeds(db_session: AsyncSession):
+    """An authorized administrator with admin:recover scope can force recovery."""
+    proj = Project(name="Admin Success Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validating",
+        approved_by="op1",
+        approved_at=now,
+        validation_claimed_at=now,
+        validation_lease_expires_at=now + timedelta(seconds=120),
+        validation_claimed_by="stuck_worker",
+        validation_claim_token="stuck_tok"
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    admin = AuthenticatedPrincipal(
+        principal_id="admin_lead",
+        role="admin",
+        scopes=["admin:recover", "patch:approve"]
+    )
+    recovered = await privileged_validation_service.force_recover_validation_claim(
+        db=db_session,
+        investigation_id=inv.id,
+        patch_id=patch.id,
+        operator=admin
+    )
+    assert recovered.status == "approved"
+    assert recovered.validation_claim_token is None
+    assert recovered.validation_lease_expires_at is None
+
+    audit_log = privileged_validation_service.get_audit_log(patch_id=patch.id)
+    success_entries = [e for e in audit_log if e.get("status") == "admin_force_recovered"]
+    assert len(success_entries) == 1
+    assert success_entries[0].get("authorized_by") == "admin_lead"
+
+
+@pytest.mark.asyncio
+async def test_force_recover_completed_patch_rejected(db_session: AsyncSession):
+    """Administrative forced recovery refuses to reset an already completed patch (validated or rejected)."""
+    proj = Project(name="Terminal Patch Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch_val = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="validated",
+        approved_by="op1",
+        approved_at=now
+    )
+    patch_rej = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="rejected",
+        approved_by="op1",
+        approved_at=now
+    )
+    db_session.add_all([patch_val, patch_rej])
+    await db_session.commit()
+
+    admin = AuthenticatedPrincipal(principal_id="admin_boss", role="admin", scopes=["admin:*"])
+
+    with pytest.raises(ValueError, match="already reached terminal status 'validated'"):
+        await privileged_validation_service.force_recover_validation_claim(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch_val.id,
+            operator=admin
+        )
+
+    with pytest.raises(ValueError, match="already reached terminal status 'rejected'"):
+        await privileged_validation_service.force_recover_validation_claim(
+            db=db_session,
+            investigation_id=inv.id,
+            patch_id=patch_rej.id,
+            operator=admin
+        )
+
+
+# --- Point 4: Extend heartbeat cleanup to entire execution lifecycle ---
+
+@pytest.mark.asyncio
+async def test_validation_lifecycle_cleanup_on_missing_entities(db_session: AsyncSession):
+    """Exceptions before tool execution (missing investigation or project) clean up heartbeat task."""
+    proj = Project(name="Lifecycle Missing Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="approved",
+        approved_by="op1",
+        approved_at=now
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    # Missing investigation:
+    with pytest.raises(ValueError, match="not found for investigation"):
+        await privileged_validation_service.execute_approved_patch_validation(
+            db=db_session,
+            investigation_id="nonexistent-inv",
+            patch_id=patch.id
+        )
+
+    # Missing project: orphaned investigation
+    inv_orphaned = Investigation(project_id="missing-project-id", objective="Orphan")
+    db_session.add(inv_orphaned)
+    await db_session.commit()
+
+    patch_orphaned = PatchProposal(
+        investigation_id=inv_orphaned.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="approved",
+        approved_by="op1",
+        approved_at=now
+    )
+    db_session.add(patch_orphaned)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="Project for investigation.*not found"):
+        await privileged_validation_service.execute_approved_patch_validation(
+            db=db_session,
+            investigation_id=inv_orphaned.id,
+            patch_id=patch_orphaned.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_validation_lifecycle_cleanup_on_cancellation(db_session: AsyncSession):
+    """Cancellation during execution triggers finally block, cancelling and awaiting heartbeat."""
+    proj = Project(name="Cancel Test Proj")
+    db_session.add(proj)
+    await db_session.commit()
+
+    inv = Investigation(project_id=proj.id, objective="Test")
+    db_session.add(inv)
+    await db_session.commit()
+
+    now = datetime.now(timezone.utc)
+    patch = PatchProposal(
+        investigation_id=inv.id,
+        target_file="pipeline.py",
+        original_code_context="ctx",
+        proposed_code="code",
+        unified_diff="diff",
+        explanation="expl",
+        status="approved",
+        approved_by="op1",
+        approved_at=now
+    )
+    db_session.add(patch)
+    await db_session.commit()
+
+    from unittest.mock import AsyncMock, patch as mock_patch
+    mock_tool = AsyncMock()
+    tool_started = asyncio.Event()
+
+    async def long_running_execute(*args, **kwargs):
+        tool_started.set()
+        await asyncio.sleep(10.0)
+        return None
+
+    mock_tool.execute = long_running_execute
+
+    with mock_patch("backend.app.services.validation_service.ValidatePatchTool", return_value=mock_tool):
+        task = asyncio.create_task(
+            privileged_validation_service.execute_approved_patch_validation(
+                db=db_session,
+                investigation_id=inv.id,
+                patch_id=patch.id,
+                lease_seconds=5,
+                renewal_interval=0.1
+            )
+        )
+        await tool_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+# --- Point 5: Improve evidence verification beyond keyword heuristics ---
+
+def test_evidence_mixed_claims_downgraded_to_inference():
+    """
+    Mixed claims containing one true fact alongside an uncorroborated assertion
+    are strictly downgraded to 'inference' rather than being marked 'verified'.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="pipeline.py", file_type="code", size_bytes=100, storage_path="/tmp/f1")
+    ]
+
+    # 1. Log analysis: KeyError exists, but "caused by memory leak in broker" is unsupported assertion
+    te_log = ToolExecution(
+        id="te_log_mixed",
+        investigation_id="inv1",
+        tool_name="analyze_logs",
+        status="success",
+        output_result={
+            "fatal_error": {
+                "last_frame": {"file": "pipeline.py", "line": 42},
+                "exception_type": "KeyError",
+                "message": "'customer_id' missing from columns"
+            }
+        }
+    )
+    ev_mixed_log = AgentEvidenceInput(
+        source_file="pipeline.py",
+        evidence_type="log_stacktrace",
+        observation="KeyError customer_id occurred in pipeline.py and was caused by an out of memory leak in broker cluster",
+        line_number=42
+    )
+    status, is_inf, matched_id = verify_evidence_against_telemetry(ev_mixed_log, files, [te_log])
+    assert status == "inference"
+    assert is_inf is True
+    assert matched_id == "te_log_mixed"
+
+    # 2. Dataset profile: null count of 15 matches, but "causes kernel panic in processing worker" is unsupported
+    te_profile = ToolExecution(
+        id="te_prof_mixed",
+        investigation_id="inv1",
+        tool_name="profile_dataset",
+        status="success",
+        output_result={
+            "dataset": {"total_rows": 100, "duplicate_rows": 0},
+            "columns": {
+                "amount": {"null_count": 15, "null_percentage": 15.0, "dtype": "float64"}
+            },
+            "anomalies": [{"column": "amount", "type": "null_values", "null_count": 15}]
+        }
+    )
+    ev_mixed_prof = AgentEvidenceInput(
+        source_file="pipeline.py",
+        column_name="amount",
+        evidence_type="dataset_profile",
+        observation="amount column has 15 null values and causes a kernel panic in processing worker",
+    )
+    status, is_inf, matched_id = verify_evidence_against_telemetry(ev_mixed_prof, files, [te_profile])
+    assert status == "inference"
+    assert is_inf is True
+    assert matched_id == "te_prof_mixed"
+
+    # 3. Code AST: calculate_tax exists, but "optimizes cache locality" is unsupported
+    te_ast = ToolExecution(
+        id="te_ast_mixed",
+        investigation_id="inv1",
+        tool_name="inspect_code",
+        status="success",
+        output_result={
+            "functions": [{"name": "calculate_tax", "lineno": 10, "end_lineno": 20, "args": ["total"]}],
+            "classes": [],
+            "imports": ["math"]
+        }
+    )
+    ev_mixed_ast = AgentEvidenceInput(
+        source_file="pipeline.py",
+        evidence_type="code_ast",
+        observation="calculate_tax function is defined and optimizes cache locality for high throughput",
+        line_number=10
+    )
+    status, is_inf, matched_id = verify_evidence_against_telemetry(ev_mixed_ast, files, [te_ast])
+    assert status == "inference"
+    assert is_inf is True
+    assert matched_id == "te_ast_mixed"
+
 
 

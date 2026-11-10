@@ -140,6 +140,7 @@ class PrivilegedValidationService:
         # 4. Atomic database state transition: 'approved' -> 'validating' with lease token
         claim_stmt = (
             update(PatchProposal)
+            .execution_options(synchronize_session=False)
             .where(
                 PatchProposal.id == patch_id,
                 PatchProposal.investigation_id == investigation_id,
@@ -193,7 +194,12 @@ class PrivilegedValidationService:
         """
         Renews an active validation lease using compare-and-swap semantics.
         A worker holding the valid claim_token can extend its lease to avoid expiration during long tests.
-        Workers lacking the matching claim_token are strictly rejected.
+        Requires:
+        1. Patch exists and matches investigation_id.
+        2. Status is 'validating'.
+        3. Claim token matches exactly.
+        4. Existing lease expiry is strictly non-null and greater than :now (unexpired).
+        Workers whose lease has already expired or who lack matching claim token are strictly rejected.
         """
         now = datetime.now(timezone.utc)
         new_expires = now + timedelta(seconds=extend_seconds)
@@ -208,13 +214,27 @@ class PrivilegedValidationService:
         if not patch:
             raise ValueError(f"Patch '{patch_id}' not found.")
 
+        # Explicit check for legacy/missing lease expiry
+        if patch.validation_lease_expires_at is None:
+            raise ValueError(f"Lease renewal rejected: Patch '{patch_id}' has no active lease expiry and cannot be renewed.")
+
+        # In-memory check for informative error diagnostics
+        exp = patch.validation_lease_expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp <= now:
+            raise ValueError(f"Lease renewal rejected: Lease for patch '{patch_id}' expired at {exp.isoformat()}. Expired leases cannot be revived.")
+
         renew_stmt = (
             update(PatchProposal)
+            .execution_options(synchronize_session=False)
             .where(
                 PatchProposal.id == patch_id,
                 PatchProposal.investigation_id == investigation_id,
                 PatchProposal.status == "validating",
-                PatchProposal.validation_claim_token == claim_token
+                PatchProposal.validation_claim_token == claim_token,
+                PatchProposal.validation_lease_expires_at.is_not(None),
+                PatchProposal.validation_lease_expires_at > now
             )
             .values(
                 validation_lease_expires_at=new_expires
@@ -225,7 +245,7 @@ class PrivilegedValidationService:
 
         if res.rowcount == 0:
             raise ValueError(
-                f"Lease renewal rejected: Invalid claim token or patch '{patch_id}' is not in validating status under this lease."
+                f"Lease renewal rejected: Lease for patch '{patch_id}' has expired, was reclaimed, or claim token is invalid."
             )
 
         await db.refresh(patch)
@@ -241,9 +261,10 @@ class PrivilegedValidationService:
         """
         Safely recovers an abandoned validation claim using compare-and-swap (CAS) semantics.
         1. Verifies that the existing claim lease has genuinely expired.
-        2. Matches the exact claim token and validation_lease_expires_at in the atomic update predicate.
-        3. Enforces validation_lease_expires_at <= :now directly in the SQL update condition.
-        4. Refuses to reset if another worker has already reclaimed, renewed, or modified the claim.
+        2. Always compares original claim token, including explicit IS NULL when observed token is null.
+        3. When original lease expiry is null, explicitly requires validation_lease_expires_at IS NULL.
+        4. When original lease expiry is non-null, compares exact original value and requires validation_lease_expires_at <= :now.
+        5. Refuses to reset if another worker has already reclaimed, renewed, or modified the claim.
         """
         now = datetime.now(timezone.utc)
         patch_res = await db.execute(
@@ -283,18 +304,26 @@ class PrivilegedValidationService:
             PatchProposal.investigation_id == investigation_id,
             PatchProposal.status == "validating"
         ]
+
+        # 1. Strict claim token comparison (including explicit IS NULL when observed token is null)
+        if expected_token is not None:
+            where_conditions.append(PatchProposal.validation_claim_token == expected_token)
+        else:
+            where_conditions.append(PatchProposal.validation_claim_token.is_(None))
+
+        # 2. Strict lease expiry comparison
         if expected_expires_at is not None:
             where_conditions.append(PatchProposal.validation_lease_expires_at == expected_expires_at)
             where_conditions.append(PatchProposal.validation_lease_expires_at <= now)
-        elif patch.validation_claimed_at is not None and timeout_seconds > 0:
-            where_conditions.append(PatchProposal.validation_claimed_at == patch.validation_claimed_at)
-            where_conditions.append(PatchProposal.validation_claimed_at <= now - timedelta(seconds=timeout_seconds))
-
-        if expected_token:
-            where_conditions.append(PatchProposal.validation_claim_token == expected_token)
+        else:
+            where_conditions.append(PatchProposal.validation_lease_expires_at.is_(None))
+            if patch.validation_claimed_at is not None and timeout_seconds > 0:
+                where_conditions.append(PatchProposal.validation_claimed_at == patch.validation_claimed_at)
+                where_conditions.append(PatchProposal.validation_claimed_at <= now - timedelta(seconds=timeout_seconds))
 
         reset_stmt = (
             update(PatchProposal)
+            .execution_options(synchronize_session=False)
             .where(*where_conditions)
             .values(
                 status="approved",
@@ -332,9 +361,49 @@ class PrivilegedValidationService:
     ) -> PatchProposal:
         """
         Explicit administrative forced recovery operation for emergency intervention.
-        Requires an authenticated operator principal with administrative authority.
+        Requires an authenticated operator principal with administrator authority and scope.
         Never called by standard automated recovery or startup recovery.
         """
+        # 1. Enforce principal presence and type
+        if not operator or not isinstance(operator, AuthenticatedPrincipal):
+            self._record_audit(PrivilegedValidationAuditEntry(
+                investigation_id=investigation_id,
+                patch_id=patch_id,
+                authorized_by="unknown",
+                status="admin_recovery_denied",
+                details="Missing or invalid authenticated principal for administrative force recovery."
+            ))
+            raise PermissionError("Security error: Administrative force recovery requires a verified AuthenticatedPrincipal.")
+
+        # 2. Enforce administrator role
+        if operator.role != "admin":
+            self._record_audit(PrivilegedValidationAuditEntry(
+                investigation_id=investigation_id,
+                patch_id=patch_id,
+                authorized_by=operator.principal_id,
+                status="admin_recovery_denied",
+                details=f"Principal '{operator.principal_id}' with role '{operator.role}' lacks administrator role."
+            ))
+            raise PermissionError(
+                f"Security violation: Principal '{operator.principal_id}' has role '{operator.role}'. "
+                f"Administrative force recovery strictly requires role 'admin'."
+            )
+
+        # 3. Enforce administrative scope
+        admin_scopes = {"admin:recover", "patch:recover", "admin:*"}
+        if not (any(s in admin_scopes for s in operator.scopes) or "admin:*" in operator.scopes or "admin:recover" in operator.scopes):
+            self._record_audit(PrivilegedValidationAuditEntry(
+                investigation_id=investigation_id,
+                patch_id=patch_id,
+                authorized_by=operator.principal_id,
+                status="admin_recovery_denied",
+                details=f"Principal '{operator.principal_id}' lacks required administrative recovery scope. Scopes present: {operator.scopes}"
+            ))
+            raise PermissionError(
+                f"Security violation: Principal '{operator.principal_id}' lacks administrative recovery scope (e.g. 'admin:recover', 'patch:recover', or 'admin:*')."
+            )
+
+        # 4. Check patch existence, investigation scoping, and terminal completion status
         patch_res = await db.execute(
             select(PatchProposal).where(
                 PatchProposal.id == patch_id,
@@ -343,13 +412,36 @@ class PrivilegedValidationService:
         )
         patch = patch_res.scalar_one_or_none()
         if not patch:
-            raise ValueError(f"Patch '{patch_id}' not found.")
+            self._record_audit(PrivilegedValidationAuditEntry(
+                investigation_id=investigation_id,
+                patch_id=patch_id,
+                authorized_by=operator.principal_id,
+                status="admin_recovery_denied",
+                details=f"Patch '{patch_id}' not found for investigation '{investigation_id}'."
+            ))
+            raise ValueError(f"Patch '{patch_id}' not found for investigation '{investigation_id}'.")
 
+        # Refuse to recover already completed patches (validated or rejected)
+        if patch.status in ("validated", "rejected"):
+            self._record_audit(PrivilegedValidationAuditEntry(
+                investigation_id=investigation_id,
+                patch_id=patch_id,
+                authorized_by=operator.principal_id,
+                status="admin_recovery_denied",
+                details=f"Cannot force recover patch '{patch_id}' because it has already reached terminal status '{patch.status}'."
+            ))
+            raise ValueError(
+                f"Administrative recovery rejected: Patch '{patch_id}' has already reached terminal status '{patch.status}'."
+            )
+
+        # 5. Atomic database state transition
         reset_stmt = (
             update(PatchProposal)
+            .execution_options(synchronize_session=False)
             .where(
                 PatchProposal.id == patch_id,
-                PatchProposal.investigation_id == investigation_id
+                PatchProposal.investigation_id == investigation_id,
+                PatchProposal.status.in_(["validating", "approved", "validation_failed"])
             )
             .values(
                 status="approved",
@@ -359,16 +451,19 @@ class PrivilegedValidationService:
                 validation_claim_token=None
             )
         )
-        await db.execute(reset_stmt)
+        res = await db.execute(reset_stmt)
         await db.commit()
-        await db.refresh(patch)
 
+        if res.rowcount == 0:
+            raise ValueError(f"Administrative recovery failed: Patch '{patch_id}' status could not be reset.")
+
+        await db.refresh(patch)
         self._record_audit(PrivilegedValidationAuditEntry(
             investigation_id=investigation_id,
             patch_id=patch_id,
             authorized_by=operator.principal_id,
             status="admin_force_recovered",
-            details=f"Emergency administrative claim recovery executed by operator '{operator.principal_id}'."
+            details=f"Emergency administrative claim recovery authorized and executed by operator '{operator.principal_id}'."
         ))
         return patch
 
@@ -385,11 +480,11 @@ class PrivilegedValidationService:
         """
         Executes an isolated validation run for an approved patch.
         1. Atomically claims patch in database ('approved' -> 'validating').
-        2. Spawns an async heartbeat renewal task that periodically extends the lease.
+        2. Spawns an async heartbeat renewal task covering entire execution lifecycle.
         3. Executes candidate patch in isolated copy.
         4. Detects loss of claim ownership and rejects commit if ownership was lost.
         5. Commits final status atomically using CAS validation token match.
-        6. Reliably cancels and cleans up heartbeat task in finally block.
+        6. Reliably cancels and cleans up heartbeat task in finally block across all exit paths.
         """
         start_time = time.time()
 
@@ -441,54 +536,43 @@ class PrivilegedValidationService:
 
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
-        # 3. Retrieve project workspace directory
-        inv_res = await db.execute(
-            select(Investigation).where(Investigation.id == investigation_id)
-        )
-        inv = inv_res.scalar_one_or_none()
-        if not inv:
-            stop_heartbeat.set()
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            raise ValueError(f"Investigation '{investigation_id}' not found.")
-
-        proj_res = await db.execute(
-            select(Project).where(Project.id == inv.project_id)
-        )
-        project = proj_res.scalar_one_or_none()
-        if not project:
-            stop_heartbeat.set()
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            raise ValueError(f"Project for investigation '{investigation_id}' not found.")
-
-        project_dir = str(settings.UPLOADS_DIR / project.id)
-
-        # Record authorized execution audit
-        self._record_audit(PrivilegedValidationAuditEntry(
-            investigation_id=investigation_id,
-            patch_id=patch_id,
-            authorized_by=patch.approved_by,
-            status="authorized",
-            details=f"Executing isolated candidate patch validation for: {patch.target_file}"
-        ))
-
-        # 4. Execute isolated candidate patch validation using ValidatePatchTool
-        val_tool = ValidatePatchTool()
-        val_args = {
-            "patch_id": patch.id,
-            "target_file": patch.target_file,
-            "proposed_code": patch.proposed_code,
-            "test_command": test_command or ["pytest"]
-        }
-
+        # Guarantees heartbeat cleanup across EVERY exit path after heartbeat task creation
         try:
+            # 3. Retrieve project workspace directory
+            inv_res = await db.execute(
+                select(Investigation).where(Investigation.id == investigation_id)
+            )
+            inv = inv_res.scalar_one_or_none()
+            if not inv:
+                raise ValueError(f"Investigation '{investigation_id}' not found.")
+
+            proj_res = await db.execute(
+                select(Project).where(Project.id == inv.project_id)
+            )
+            project = proj_res.scalar_one_or_none()
+            if not project:
+                raise ValueError(f"Project for investigation '{investigation_id}' not found.")
+
+            project_dir = str(settings.UPLOADS_DIR / project.id)
+
+            # Record authorized execution audit
+            self._record_audit(PrivilegedValidationAuditEntry(
+                investigation_id=investigation_id,
+                patch_id=patch_id,
+                authorized_by=patch.approved_by,
+                status="authorized",
+                details=f"Executing isolated candidate patch validation for: {patch.target_file}"
+            ))
+
+            # 4. Execute isolated candidate patch validation using ValidatePatchTool
+            val_tool = ValidatePatchTool()
+            val_args = {
+                "patch_id": patch.id,
+                "target_file": patch.target_file,
+                "proposed_code": patch.proposed_code,
+                "test_command": test_command or ["pytest"]
+            }
+
             tool_result = await val_tool.execute(
                 project_path=project_dir,
                 arguments=val_args
@@ -527,6 +611,7 @@ class PrivilegedValidationService:
             final_patch_status = "validated" if val_status == "passed" else "validation_failed"
             commit_stmt = (
                 update(PatchProposal)
+                .execution_options(synchronize_session=False)
                 .where(
                     PatchProposal.id == patch.id,
                     PatchProposal.investigation_id == investigation_id,
@@ -573,10 +658,11 @@ class PrivilegedValidationService:
 
         except Exception as e:
             logger.error(f"Execution error during validation of patch {patch_id}: {e}", exc_info=True)
-            if not ownership_lost:
+            if not ownership_lost and not isinstance(e, asyncio.CancelledError):
                 try:
                     fail_stmt = (
                         update(PatchProposal)
+                        .execution_options(synchronize_session=False)
                         .where(
                             PatchProposal.id == patch.id,
                             PatchProposal.investigation_id == investigation_id,
@@ -591,7 +677,7 @@ class PrivilegedValidationService:
                         )
                     )
                     await db.execute(fail_stmt)
-                    if inv:
+                    if 'inv' in locals() and inv:
                         inv.status = "patch_validation_failed"
                         inv.stage = "report_generation"
                     await db.commit()
@@ -604,7 +690,7 @@ class PrivilegedValidationService:
             heartbeat_task.cancel()
             try:
                 await heartbeat_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
 
