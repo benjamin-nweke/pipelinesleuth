@@ -5,6 +5,7 @@ patch review, sandbox containment, and failure modes.
 """
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import select
 
@@ -291,13 +292,19 @@ async def test_investigation_loop_with_hypothesis_revision_and_patch(test_sessio
 
 @pytest.mark.asyncio
 async def test_missing_docker_security_boundary(test_session: AsyncSession):
-    # Test sandbox refuses arbitrary host execution if Docker is not available
-    res = await sandbox_manager.run_in_sandbox(
-        workspace_path="/tmp",
-        command=["python3", "-c", "print('hello')"]
-    )
-    # Since Docker is not running on this machine, it must return docker_available=False
-    # and NOT execute unsafely on the host!
+    # Test sandbox refuses arbitrary host execution when Docker is explicitly unavailable
+    with patch(
+        "backend.app.sandbox.manager.asyncio.create_subprocess_exec",
+        side_effect=FileNotFoundError("docker"),
+    ) as mock_subproc:
+        res = await sandbox_manager.run_in_sandbox(
+            workspace_path="/tmp",
+            command=["python3", "-c", "print('hello')"]
+        )
+
+    mock_subproc.assert_called_once()
+    assert mock_subproc.call_args.args == ("docker", "info")
+    assert res["success"] is False
     assert res["docker_available"] is False
     assert res["exit_code"] == -1
     assert "EXECUTION BLOCKED BY SECURITY POLICY" in res["stderr"]

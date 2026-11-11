@@ -16,6 +16,7 @@ from backend.app.database.session import AsyncSessionLocal
 from backend.app.models.investigation import Investigation
 from backend.app.models.project import Project
 from backend.app.models.patch import PatchProposal, ValidationRun
+from backend.app.services.report_service import generate_or_update_investigation_report
 from backend.app.tools.validate_patch import ValidatePatchTool
 from backend.app.core.config import settings
 from backend.app.core.auth import AuthenticatedPrincipal
@@ -569,7 +570,8 @@ class PrivilegedValidationService:
             val_args = {
                 "patch_id": patch.id,
                 "target_file": patch.target_file,
-                "proposed_code": patch.proposed_code,
+                "original_snippet": patch.original_code_context or "",
+                "replacement_code": patch.proposed_code or "",
                 "test_command": test_command or ["pytest"]
             }
 
@@ -588,7 +590,29 @@ class PrivilegedValidationService:
             stdout = res_data.get("stdout", "")
             stderr = res_data.get("stderr", "") or (tool_result.error or "")
             exit_code = res_data.get("exit_code", 0 if tool_result.success else 1)
-            val_status = "passed" if (tool_result.success and exit_code == 0) else "failed"
+            docker_available = res_data.get("docker_available")
+            validation_status = res_data.get("validation_status")
+            patch_applied = res_data.get("patch_applied")
+
+            patch_apply_failed = (patch_applied is False)
+            docker_blocked = (
+                docker_available is False
+                or validation_status == "skipped"
+                or "EXECUTION BLOCKED BY SECURITY POLICY" in (stderr or "")
+            )
+            if tool_result.success and exit_code == 0 and not patch_apply_failed and not docker_blocked:
+                val_status = "passed"
+            else:
+                val_status = "failed"
+
+            raw_test_summary = dict(res_data.get("test_summary") or {})
+            if docker_available is not None:
+                raw_test_summary["docker_available"] = bool(docker_available)
+            if validation_status is not None:
+                raw_test_summary["validation_status"] = validation_status
+            if patch_applied is not None:
+                raw_test_summary["patch_applied"] = bool(patch_applied)
+
             execution_time_ms = int((time.time() - start_time) * 1000)
 
             # 5. Persist ValidationRun record bound to the patch and approver
@@ -599,7 +623,7 @@ class PrivilegedValidationService:
                 exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
-                test_summary=res_data.get("test_summary", {}),
+                test_summary=raw_test_summary,
                 regression_results=res_data.get("regression_results", {}),
                 execution_time_ms=execution_time_ms,
                 authorized_by=patch.approved_by,
@@ -636,7 +660,7 @@ class PrivilegedValidationService:
                 patch.status = "validated"
                 if inv:
                     inv.status = "patch_validated"
-                    inv.stage = "regression_testing"
+                    inv.stage = "report_generation"
             else:
                 patch.status = "validation_failed"
                 if inv:
@@ -645,6 +669,12 @@ class PrivilegedValidationService:
 
             await db.commit()
             await db.refresh(validation_run)
+
+            # Generate or update final report now that terminal validation state is persisted
+            await generate_or_update_investigation_report(
+                db=db,
+                investigation_id=investigation_id,
+            )
 
             self._record_audit(PrivilegedValidationAuditEntry(
                 investigation_id=investigation_id,
@@ -681,6 +711,10 @@ class PrivilegedValidationService:
                         inv.status = "patch_validation_failed"
                         inv.stage = "report_generation"
                     await db.commit()
+                    await generate_or_update_investigation_report(
+                        db=db,
+                        investigation_id=investigation_id,
+                    )
                 except Exception as db_err:
                     logger.error(f"Failed to record validation failure state: {db_err}")
             raise

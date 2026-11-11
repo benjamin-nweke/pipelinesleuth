@@ -16,7 +16,7 @@ class InvestigationReport(Base):
     __tablename__ = "investigation_reports"
 
     id = Column(String(36), primary_key=True, default=lambda: f"REP-{uuid.uuid4().hex[:6].upper()}")
-    investigation_id = Column(String(36), ForeignKey("investigations.id", ondelete="CASCADE"), nullable=False)
+    investigation_id = Column(String(36), ForeignKey("investigations.id", ondelete="CASCADE"), nullable=False, unique=True)
     title = Column(String(255), nullable=False)
     summary = Column(Text, nullable=False)
     root_cause = Column(Text, nullable=False)

@@ -19,8 +19,8 @@ from backend.app.models.investigation import (
     Investigation, InvestigationEvent, EvidenceRecord, Hypothesis, ToolExecution
 )
 from backend.app.models.patch import PatchProposal
-from backend.app.models.report import InvestigationReport
 from backend.app.models.project import Project, ProjectFile
+from backend.app.services.report_service import generate_or_update_investigation_report
 from backend.app.tools.registry import tool_registry
 from backend.app.agents.provider import AIProvider, ModelProviderError
 from backend.app.agents.prompts import INVESTIGATION_SYSTEM_PROMPT
@@ -2028,7 +2028,16 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
 
             if action in ("conclude_success", "conclude_inconclusive") or loop_counter >= self.max_tool_calls:
                 final_rep = decision.final_report
-                is_success = (action == "conclude_success" and investigation.confidence_score >= 0.7)
+                patch_check_res = await self.db.execute(
+                    select(PatchProposal).where(PatchProposal.investigation_id == self.investigation_id)
+                )
+                existing_patches = patch_check_res.scalars().all()
+                has_unvalidated_patch = any(p.status != "validated" for p in existing_patches)
+                is_success = (
+                    action == "conclude_success"
+                    and investigation.confidence_score >= 0.7
+                    and not has_unvalidated_patch
+                )
 
                 investigation.status = "completed" if is_success else "inconclusive"
                 investigation.stage = "report_generation"
@@ -2047,77 +2056,24 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
 
     async def _build_final_report(self, rep_input: Optional[Any], is_success: bool) -> None:
         """Constructs and stores the final markdown investigation report."""
-        inv_result = await self.db.execute(
-            select(Investigation).where(Investigation.id == self.investigation_id)
-        )
-        inv = inv_result.scalar_one()
-
-        ev_result = await self.db.execute(
-            select(EvidenceRecord).where(EvidenceRecord.investigation_id == self.investigation_id)
-        )
-        evidence = ev_result.scalars().all()
-
-        hyp_result = await self.db.execute(
-            select(Hypothesis).where(Hypothesis.investigation_id == self.investigation_id)
-        )
-        hypotheses = hyp_result.scalars().all()
-
-        confirmed_hyp = [h for h in hypotheses if h.status == "confirmed"]
-        rejected_hyp = [h for h in hypotheses if h.status == "rejected"]
-
-        title = getattr(rep_input, "title", None) or f"Investigation Report: {inv.objective[:50]}"
-        summary = getattr(rep_input, "summary", None) or (
-            f"Investigation concluded with verdict: {'CONFIRMED ROOT CAUSE' if is_success else 'INCONCLUSIVE'}. "
-            f"Analyzed {len(evidence)} evidence records across {len(hypotheses)} hypotheses."
-        )
-        root_cause = getattr(rep_input, "root_cause", None) or (
-            confirmed_hyp[0].description if confirmed_hyp else "No singular root cause could be verified with necessary confidence."
-        )
-        components = getattr(rep_input, "affected_components", []) or list(set(e.source_file for e in evidence))
-        risks = getattr(rep_input, "remaining_risks", None) or "None recorded."
-        next_steps = getattr(rep_input, "next_steps", []) or ["Review evidence records", "Deploy approved fixes"]
-
-        md_lines = [
-            f"# {title}\n",
-            f"**Status:** {'COMPLETED' if is_success else 'INCONCLUSIVE'} | **Confidence:** {int(inv.confidence_score * 100)}%\n",
-            f"### 1. Investigation Objective\n{inv.objective}\n",
-            f"### 2. Summary of Failure\n{summary}\n",
-            f"### 3. Affected Pipeline Components\n" + "\n".join([f"- `{c}`" for c in components]) + "\n",
-            f"### 4. Root Cause Assessment\n{root_cause}\n",
-            f"**Confidence Justification:** {inv.confidence_justification or 'Based on collected runtime evidence'}\n",
-            f"### 5. Supporting Traceable Evidence\n"
-        ]
-        for e in evidence:
-            md_lines.append(f"- **[{e.id}] ({e.evidence_type})** `{e.source_file}`: {e.observation}")
-        
-        md_lines.append(f"\n### 6. Hypotheses Evaluated\n")
-        for h in hypotheses:
-            md_lines.append(f"- **{h.title}** (`{h.status}`, confidence: {h.confidence}): {h.reasoning or h.description}")
-
-        md_lines.append(f"\n### 7. Remaining Risks\n{risks}\n")
-        md_lines.append(f"### 8. Recommended Next Steps\n" + "\n".join([f"1. {s}" for s in next_steps]))
-
-        markdown_report = "\n".join(md_lines)
-
-        report = InvestigationReport(
+        report = await generate_or_update_investigation_report(
+            db=self.db,
             investigation_id=self.investigation_id,
-            title=title,
-            summary=summary,
-            root_cause=root_cause,
-            affected_components=components,
-            supporting_evidence=[{"id": e.id, "type": e.evidence_type, "obs": e.observation} for e in evidence],
-            hypotheses_evaluated=[{"id": h.id, "title": h.title, "status": h.status} for h in hypotheses],
-            hypotheses_rejected=[{"id": h.id, "title": h.title} for h in rejected_hyp],
-            remaining_risks=risks,
-            next_steps=next_steps,
-            markdown_content=markdown_report
+            rep_input=rep_input,
+            is_success_hint=is_success,
         )
-        self.db.add(report)
-        await self.db.commit()
+        if report is None:
+            return
+
+        effective_success = (
+            bool((report.validation_summary or {}).get("validated", False))
+            if (report.proposed_correction or {})
+            else is_success
+        )
 
         await self.emit_event(
             "report_ready",
-            f"Final Report Generated: {title}",
-            {"report_id": report.id, "root_cause": root_cause, "is_success": is_success}
+            f"Final Report Generated: {report.title}",
+            {"report_id": report.id, "root_cause": report.root_cause, "is_success": effective_success}
         )
 

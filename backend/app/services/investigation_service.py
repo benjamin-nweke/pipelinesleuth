@@ -13,11 +13,13 @@ from backend.app.database.session import AsyncSessionLocal
 from backend.app.models.investigation import Investigation, InvestigationEvent
 from backend.app.models.patch import PatchProposal, ValidationRun
 from backend.app.models.project import Project
+from backend.app.models.report import InvestigationReport
 from backend.app.agents.engine import InvestigationEngine
 from backend.app.agents.provider import AIProvider
 from backend.app.sandbox.manager import sandbox_manager
 from backend.app.core.config import settings
 from backend.app.core.auth import AuthenticatedPrincipal
+from backend.app.services.report_service import generate_or_update_investigation_report
 from backend.app.services.validation_service import privileged_validation_service
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,8 @@ class InvestigationService:
     def __init__(self):
         # Event queues mapped by investigation_id: list of asyncio.Queue
         self._subscribers: Dict[str, List[asyncio.Queue]] = {}
+        # Active background investigation tasks mapped by investigation_id
+        self._active_investigations: Dict[str, asyncio.Task] = {}
         # Concurrency safety tracking for active validation tasks
         self._active_validations: Set[str] = set()
         self._validation_lock = asyncio.Lock()
@@ -53,48 +57,105 @@ class InvestigationService:
                 except Exception:
                     pass
 
+    async def create_investigation(
+        self,
+        db: AsyncSession,
+        project_id: str,
+        objective: str,
+    ) -> Investigation:
+        """
+        Validates the target project exists, persists a new Investigation record,
+        commits and refreshes it before any background work is scheduled.
+        """
+        proj_res = await db.execute(select(Project).where(Project.id == project_id))
+        project = proj_res.scalar_one_or_none()
+        if not project:
+            raise ValueError(f"Project '{project_id}' not found.")
+
+        inv = Investigation(
+            project_id=project_id,
+            objective=objective,
+            status="created",
+            stage="context_collection",
+            confidence_score=0.0,
+            remaining_budget=settings.MAX_TOOL_CALLS,
+        )
+        db.add(inv)
+        await db.commit()
+        await db.refresh(inv)
+        return inv
+
+    def dispatch_investigation_background(
+        self,
+        investigation_id: str,
+        provider: Optional[AIProvider] = None,
+    ) -> asyncio.Task:
+        """
+        Schedules background investigation execution using its own dedicated AsyncSessionLocal session.
+        """
+        task = asyncio.create_task(
+            self._run_investigation_background(investigation_id, provider=provider)
+        )
+        self._active_investigations[investigation_id] = task
+        task.add_done_callback(lambda _t: self._active_investigations.pop(investigation_id, None))
+        return task
+
     async def start_investigation(
         self,
         db: AsyncSession,
-        investigation_id: str,
-        provider: Optional[AIProvider] = None
-    ) -> None:
-        engine = InvestigationEngine(
+        project_id: str,
+        objective: str,
+        provider: Optional[AIProvider] = None,
+    ) -> Investigation:
+        inv = await self.create_investigation(
             db=db,
-            investigation_id=investigation_id,
-            ai_provider=provider,
-            event_callback=lambda ev: self.broadcast(investigation_id, ev)
+            project_id=project_id,
+            objective=objective,
         )
-        # Run autonomous loop asynchronously
-        asyncio.create_task(self._run_investigation_background(engine, investigation_id))
+        # Run autonomous loop asynchronously using a separate background session
+        self.dispatch_investigation_background(inv.id, provider=provider)
+        return inv
 
     async def _run_investigation_background(
         self,
-        engine: InvestigationEngine,
-        investigation_id: str
+        investigation_id: str,
+        provider: Optional[AIProvider] = None,
     ) -> None:
         try:
-            await engine.run()
+            async with AsyncSessionLocal() as session:
+                engine = InvestigationEngine(
+                    db=session,
+                    investigation_id=investigation_id,
+                    ai_provider=provider,
+                    event_callback=lambda ev: self.broadcast(investigation_id, ev),
+                )
+                await engine.run()
+        except asyncio.CancelledError:
+            logger.info(f"Background investigation {investigation_id} was cancelled.")
+            raise
         except Exception as e:
             logger.error(f"Investigation {investigation_id} failed with unhandled exception: {e}", exc_info=True)
-            async with AsyncSessionLocal() as session:
-                res = await session.execute(
-                    select(Investigation).where(Investigation.id == investigation_id)
-                )
-                inv = res.scalar_one_or_none()
-                if inv:
-                    inv.status = "failed"
-                    inv.stage = "report_generation"
-                    inv.root_cause_summary = f"Investigation terminated unexpectedly: {str(e)}"
-                    await session.commit()
-                self.broadcast(
-                    investigation_id,
-                    {
-                        "event_type": "investigation_failed",
-                        "title": "Investigation Encountered Unhandled Error",
-                        "payload": {"error": str(e)}
-                    }
-                )
+            try:
+                async with AsyncSessionLocal() as recovery_session:
+                    res = await recovery_session.execute(
+                        select(Investigation).where(Investigation.id == investigation_id)
+                    )
+                    inv = res.scalar_one_or_none()
+                    if inv:
+                        inv.status = "failed"
+                        inv.stage = "report_generation"
+                        inv.root_cause_summary = f"Investigation terminated unexpectedly: {str(e)}"
+                        await recovery_session.commit()
+                    self.broadcast(
+                        investigation_id,
+                        {
+                            "event_type": "investigation_failed",
+                            "title": "Investigation Encountered Unhandled Error",
+                            "payload": {"error": str(e)},
+                        },
+                    )
+            except Exception as persist_err:
+                logger.error(f"Failed to record investigation failure state for {investigation_id}: {persist_err}")
 
     async def handle_patch_action(
         self,
@@ -195,6 +256,10 @@ class InvestigationService:
             await db.commit()
 
         if action == "reject":
+            report = await generate_or_update_investigation_report(
+                db=db,
+                investigation_id=investigation_id,
+            )
             self.broadcast(investigation_id, {
                 "event_type": "patch_rejected",
                 "title": f"Patch Rejected by Operator: {patch.target_file}",
@@ -205,6 +270,16 @@ class InvestigationService:
                     "authorized_by": approver_identity
                 }
             })
+            if report is not None:
+                self.broadcast(investigation_id, {
+                    "event_type": "report_ready",
+                    "title": f"Final Report Generated: {report.title}",
+                    "payload": {
+                        "report_id": report.id,
+                        "root_cause": report.root_cause,
+                        "is_success": False,
+                    },
+                })
             return patch
 
         # Approved action
@@ -302,6 +377,12 @@ class InvestigationService:
                     investigation_id=investigation_id,
                     patch_id=patch_id
                 )
+                rep_res = await session.execute(
+                    select(InvestigationReport).where(
+                        InvestigationReport.investigation_id == investigation_id
+                    )
+                )
+                persisted_report = rep_res.scalar_one_or_none()
                 self.broadcast(investigation_id, {
                     "event_type": "validation_result",
                     "title": f"Validation Completed: {val_run.status.upper()}",
@@ -313,6 +394,17 @@ class InvestigationService:
                         "authorized_by": val_run.authorized_by
                     }
                 })
+                if persisted_report is not None:
+                    val_summary = persisted_report.validation_summary or {}
+                    self.broadcast(investigation_id, {
+                        "event_type": "report_ready",
+                        "title": f"Final Report Generated: {persisted_report.title}",
+                        "payload": {
+                            "report_id": persisted_report.id,
+                            "root_cause": persisted_report.root_cause,
+                            "is_success": bool(val_summary.get("validated", False)),
+                        },
+                    })
         except Exception as e:
             logger.error(f"Background validation failed for patch {patch_id}: {e}", exc_info=True)
             # Recovery: ensure patch and investigation state do not stay stranded
@@ -322,18 +414,26 @@ class InvestigationService:
                         select(PatchProposal).where(PatchProposal.id == patch_id)
                     )
                     p = p_res.scalar_one_or_none()
-                    if p and p.status == "approved":
-                        failed_run = ValidationRun(
-                            investigation_id=investigation_id,
-                            patch_id=patch_id,
-                            status="failed",
-                            exit_code=1,
-                            stdout="",
-                            stderr=f"Validation execution failed: {str(e)}",
-                            authorized_by=p.approved_by,
-                            authorized_at=p.approved_at
+                    if p and p.status in ("approved", "validation_failed"):
+                        existing_run_res = await recovery_session.execute(
+                            select(ValidationRun).where(ValidationRun.patch_id == patch_id)
                         )
-                        recovery_session.add(failed_run)
+                        existing_run = existing_run_res.scalar_one_or_none()
+                        if existing_run is None:
+                            failed_run = ValidationRun(
+                                investigation_id=investigation_id,
+                                patch_id=patch_id,
+                                status="failed",
+                                exit_code=1,
+                                stdout="",
+                                stderr=f"Validation execution failed: {str(e)}",
+                                authorized_by=p.approved_by,
+                                authorized_at=p.approved_at
+                            )
+                            recovery_session.add(failed_run)
+                        else:
+                            failed_run = existing_run
+
                         p.status = "validation_failed"
 
                         i_res = await recovery_session.execute(
@@ -341,22 +441,38 @@ class InvestigationService:
                         )
                         i = i_res.scalar_one_or_none()
                         if i:
-                            i.status = "inconclusive"
+                            i.status = "patch_validation_failed"
                             i.stage = "report_generation"
 
                         await recovery_session.commit()
+                        await recovery_session.refresh(failed_run)
+
+                        recovery_report = await generate_or_update_investigation_report(
+                            db=recovery_session,
+                            investigation_id=investigation_id,
+                        )
 
                         self.broadcast(investigation_id, {
                             "event_type": "validation_result",
                             "title": "Validation Failed: System Error",
                             "payload": {
                                 "validation_id": failed_run.id,
-                                "status": "failed",
-                                "exit_code": 1,
+                                "status": failed_run.status,
+                                "exit_code": failed_run.exit_code,
                                 "error": str(e),
                                 "authorized_by": p.approved_by
                             }
                         })
+                        if recovery_report is not None:
+                            self.broadcast(investigation_id, {
+                                "event_type": "report_ready",
+                                "title": f"Final Report Generated: {recovery_report.title}",
+                                "payload": {
+                                    "report_id": recovery_report.id,
+                                    "root_cause": recovery_report.root_cause,
+                                    "is_success": False,
+                                },
+                            })
             except Exception as persist_err:
                 logger.error(f"Failed to record validation failure state: {persist_err}")
         finally:

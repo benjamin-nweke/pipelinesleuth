@@ -72,25 +72,30 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-def check_validation_runs_unique_index(connection) -> bool:
+def check_unique_single_column_index(connection, table_name: str, column_name: str) -> bool:
     """
-    Directly inspects SQLite index metadata:
-    - Queries PRAGMA index_list(validation_runs) checking unique == 1
-    - Queries PRAGMA index_info(name) verifying indexed columns are strictly ['patch_id']
-    Does NOT infer uniqueness from index names or substrings.
+    Directly inspects SQLite index metadata for a unique single-column index
+    on `table_name(column_name)` via PRAGMA index_list and PRAGMA index_info.
     """
-    res = connection.execute(text("PRAGMA index_list(validation_runs)"))
-    rows = res.fetchall()
-    for row in rows:
+    res = connection.execute(text(f"PRAGMA index_list('{table_name}')"))
+    for row in res.fetchall():
         # SQLite PRAGMA index_list returns: (seq, name, unique, origin, partial)
         idx_name = row[1]
         is_unique = bool(row[2])
         if is_unique:
-            info_res = connection.execute(text(f"PRAGMA index_info('{idx_name}')"))
+            safe_idx = str(idx_name).replace("'", "''")
+            info_res = connection.execute(text(f"PRAGMA index_info('{safe_idx}')"))
             cols = [col_row[2] for col_row in info_res.fetchall()]
-            if cols == ["patch_id"]:
+            if cols == [column_name]:
                 return True
     return False
+
+
+def check_validation_runs_unique_index(connection) -> bool:
+    """
+    Directly inspects SQLite index metadata for a unique index on validation_runs(patch_id).
+    """
+    return check_unique_single_column_index(connection, "validation_runs", "patch_id")
 
 
 def sync_upgrade_schema(connection) -> None:
@@ -113,14 +118,10 @@ def sync_upgrade_schema(connection) -> None:
             connection.execute(text("ALTER TABLE patch_proposals ADD COLUMN validation_lease_expires_at DATETIME"))
 
     # 2. Enforce unique index on validation_runs(patch_id)
-    res = connection.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='validation_runs'"))
-    if not res.fetchone():
-        return
-
-    has_unique = check_validation_runs_unique_index(connection)
-
-    if not has_unique:
-        # Inspect existing records for duplicate patch IDs
+    val_tbl = connection.execute(
+        text("SELECT name FROM sqlite_master WHERE type='table' AND name='validation_runs'")
+    ).fetchone()
+    if val_tbl and not check_validation_runs_unique_index(connection):
         dup_query = text("""
             SELECT patch_id, COUNT(*) as cnt 
             FROM validation_runs 
@@ -156,16 +157,64 @@ def sync_upgrade_schema(connection) -> None:
                     )
                 logger.info(f"Remediated duplicate validation runs for patch '{p_id}': retained {keep_id}, removed {len(delete_ids)} duplicates.")
 
-        # Create unique index without swallowing exceptions
         try:
             connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_validation_runs_patch_id ON validation_runs (patch_id)"))
         except Exception as e:
             raise RuntimeError(f"Database migration error: Failed to create unique index 'uq_validation_runs_patch_id': {e}") from e
 
-        # Post-migration verification against SQLite metadata
         if not check_validation_runs_unique_index(connection):
             raise RuntimeError(
                 "Database migration verification error: Unique index on validation_runs(patch_id) "
+                "could not be verified in SQLite index metadata after creation."
+            )
+
+    # 3. Enforce unique index on investigation_reports(investigation_id)
+    rep_tbl = connection.execute(
+        text("SELECT name FROM sqlite_master WHERE type='table' AND name='investigation_reports'")
+    ).fetchone()
+    if rep_tbl and not check_unique_single_column_index(connection, "investigation_reports", "investigation_id"):
+        rep_dups = connection.execute(text("""
+            SELECT investigation_id, COUNT(*) as cnt
+            FROM investigation_reports
+            GROUP BY investigation_id
+            HAVING cnt > 1
+        """)).fetchall()
+
+        for dup_row in rep_dups:
+            inv_id = dup_row[0]
+            rows = connection.execute(
+                text(
+                    "SELECT id FROM investigation_reports "
+                    "WHERE investigation_id = :inv_id ORDER BY created_at DESC, id DESC"
+                ),
+                {"inv_id": inv_id}
+            ).fetchall()
+            keep_id = rows[0][0]
+            for row in rows[1:]:
+                connection.execute(
+                    text("DELETE FROM investigation_reports WHERE id = :del_id"),
+                    {"del_id": row[0]}
+                )
+            logger.info(
+                f"Remediated duplicate investigation reports for investigation '{inv_id}': "
+                f"retained {keep_id}, removed {len(rows) - 1} duplicates."
+            )
+
+        try:
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_investigation_reports_investigation_id ON investigation_reports (investigation_id)"
+                )
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Database migration error: Failed to create unique index 'uq_investigation_reports_investigation_id': {e}"
+            ) from e
+
+        if not check_unique_single_column_index(connection, "investigation_reports", "investigation_id"):
+            raise RuntimeError(
+                "Database migration verification error: Unique index on investigation_reports(investigation_id) "
                 "could not be verified in SQLite index metadata after creation."
             )
 

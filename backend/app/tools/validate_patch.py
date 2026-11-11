@@ -5,6 +5,7 @@ Executes pytest and entrypoint scripts to verify fix and check for regressions.
 Returns genuine process exit code, stdout, stderr, and test summary.
 """
 import time
+import uuid
 import re
 import os
 from pathlib import Path
@@ -158,10 +159,37 @@ class ValidatePatchTool(BaseDiagnosticTool):
         replacement_code = arguments.get("replacement_code", "")
         test_cmd = arguments.get("test_command", ["pytest"])
 
+        if not isinstance(original_snippet, str) or not original_snippet.strip():
+            return ToolResult(
+                success=False,
+                data={"patch_applied": False},
+                summary="Patch validation failed: original_snippet must be a non-empty string.",
+                error="Missing or empty original_snippet.",
+                execution_time_ms=int((time.time() - start_time) * 1000)
+            )
+
+        if not isinstance(replacement_code, str) or not replacement_code.strip():
+            return ToolResult(
+                success=False,
+                data={"patch_applied": False},
+                summary="Patch validation failed: replacement_code must be a non-empty string.",
+                error="Missing or empty replacement_code.",
+                execution_time_ms=int((time.time() - start_time) * 1000)
+            )
+
+        if not isinstance(test_cmd, list) or not test_cmd or not all(isinstance(arg, str) and arg for arg in test_cmd):
+            return ToolResult(
+                success=False,
+                data={"patch_applied": False},
+                summary="Patch validation failed: test_command must be a non-empty list of strings.",
+                error="Invalid test_command argument.",
+                execution_time_ms=int((time.time() - start_time) * 1000)
+            )
+
         # 1. Create separate candidate workspace copy
         candidate_ws = sandbox_manager.create_isolated_workspace(
             source_project_path=project_path,
-            candidate_name=f"cand_val_{int(start_time)}"
+            candidate_name=f"cand_val_{uuid.uuid4().hex[:12]}"
         )
 
         try:
@@ -172,6 +200,7 @@ class ValidatePatchTool(BaseDiagnosticTool):
             if not is_valid or candidate_file is None:
                 return ToolResult(
                     success=False,
+                    data={"patch_applied": False},
                     summary=f"Path validation failed: {path_err}",
                     error=path_err,
                     execution_time_ms=int((time.time() - start_time) * 1000)
@@ -181,13 +210,31 @@ class ValidatePatchTool(BaseDiagnosticTool):
             if original_snippet not in content:
                 return ToolResult(
                     success=False,
+                    data={"patch_applied": False},
                     summary="Original snippet could not be matched in candidate workspace file.",
                     error="Snippet mismatch.",
                     execution_time_ms=int((time.time() - start_time) * 1000)
                 )
 
             new_content = content.replace(original_snippet, replacement_code, 1)
+            if new_content == content:
+                return ToolResult(
+                    success=False,
+                    data={"patch_applied": False},
+                    summary="Patch replacement produced no changes in candidate workspace file.",
+                    error="No-op patch replacement.",
+                    execution_time_ms=int((time.time() - start_time) * 1000)
+                )
+
             candidate_file.write_text(new_content, encoding="utf-8")
+            if candidate_file.read_text(encoding="utf-8") == content:
+                return ToolResult(
+                    success=False,
+                    data={"patch_applied": False},
+                    summary="Candidate file write verification failed: content remained unchanged.",
+                    error="Patch write verification failed.",
+                    execution_time_ms=int((time.time() - start_time) * 1000)
+                )
 
             # 3. Execute validation command inside sandbox
             run_res = await sandbox_manager.run_in_sandbox(
@@ -223,6 +270,8 @@ class ValidatePatchTool(BaseDiagnosticTool):
             return ToolResult(
                 success=passed,
                 data={
+                    "patch_applied": True,
+                    "target_file": target_file_rel,
                     "validation_status": validation_status,
                     "exit_code": exit_code,
                     "docker_available": docker_avail,

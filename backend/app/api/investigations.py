@@ -33,12 +33,15 @@ async def create_investigation(
     req: InvestigationCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    inv = await investigation_service.start_investigation(
-        db=db,
-        project_id=req.project_id,
-        objective=req.objective
-    )
-    return inv
+    try:
+        inv = await investigation_service.start_investigation(
+            db=db,
+            project_id=req.project_id,
+            objective=req.objective
+        )
+        return inv
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
 
 
 @router.get("", response_model=List[InvestigationRead])
