@@ -2965,5 +2965,296 @@ async def test_evidence_real_tool_schemas_positive_verification(tmp_path: Path):
     assert s_false_col == "unverified"
 
 
+# ==============================================================================
+# 11. SCHEMA TYPE MISMATCH ROLE PRESERVATION REGRESSION TESTS
+# ==============================================================================
+
+
+def test_schema_type_mismatch_preserves_expected_and_actual_roles():
+    """
+    Type mismatch verification must preserve exact column -> expected_dtype -> actual_dtype
+    role bindings: accepting valid full or narrower claims, while rejecting reversed,
+    incorrect, unsupported, ambiguous, or cross-column claims.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="data/orders.csv", file_type="data", size_bytes=100, storage_path="/tmp/f1")
+    ]
+    te_schema = ToolExecution(
+        id="TE-SCH-TM",
+        investigation_id="INV-TM",
+        tool_name="inspect_schema",
+        status="success",
+        output_result={
+            "target_schema": {
+                "columns": ["customer_id", "amount", "quantity"],
+                "fields": {
+                    "customer_id": {"dtype": "int64", "nullable": False},
+                    "amount": {"dtype": "object", "nullable": False},
+                    "quantity": {"dtype": "str", "nullable": False},
+                },
+                "total_columns": 3,
+            },
+            "differences": {
+                "has_drift": True,
+                "missing_columns": [],
+                "unexpected_columns": [],
+                "type_mismatches": [
+                    {"column": "amount", "expected_dtype": "float64", "actual_dtype": "object"},
+                    {"column": "quantity", "expected_dtype": "int64", "actual_dtype": "str"},
+                ],
+                "renamed_candidates": [],
+            },
+        },
+    )
+
+    # 1. Correct expected and actual types -> verified
+    for obs in (
+        "The amount column has a type mismatch: expected float64, actual object.",
+        "amount column type mismatch: actual object, expected float64",
+        "Type mismatch on amount: expected_dtype=float64, actual_dtype=object",
+        "The amount column has a type mismatch: actual object instead of float64",
+        "The amount column has a type mismatch: float64 expected, object actual",
+    ):
+        s, is_inf, tid = verify_evidence_against_telemetry(
+            AgentEvidenceInput(
+                source_file="data/orders.csv",
+                evidence_type="schema_diff",
+                column_name="amount",
+                tool_execution_id="TE-SCH-TM",
+                observation=obs,
+            ),
+            files, [te_schema], investigation_id="INV-TM",
+        )
+        assert s == "verified", f"Expected verified for: {obs}"
+        assert is_inf is False
+        assert tid == "TE-SCH-TM"
+
+    # 2. Reversed expected and actual types -> unverified
+    for rev_obs in (
+        "The amount column has a type mismatch: expected object, actual float64.",
+        "The amount column has a type mismatch: actual float64, expected object.",
+        "The amount column has a type mismatch: expected_dtype=object, actual_dtype=float64.",
+        "The amount column has a type mismatch: float64 instead of object.",
+        "The amount column has a type mismatch: object expected, float64 actual.",
+    ):
+        s_rev, _, _ = verify_evidence_against_telemetry(
+            AgentEvidenceInput(
+                source_file="data/orders.csv",
+                evidence_type="schema_diff",
+                column_name="amount",
+                tool_execution_id="TE-SCH-TM",
+                observation=rev_obs,
+            ),
+            files, [te_schema], investigation_id="INV-TM",
+        )
+        assert s_rev == "unverified", f"Expected unverified for reversed roles: {rev_obs}"
+
+    # 3. Incorrect expected type -> unverified
+    for bad_exp in (
+        "The amount column has a type mismatch: expected int64, actual object.",
+        "The amount column has a type mismatch: expected decimal, actual object.",
+        "The amount column has a type mismatch: expected object.",
+    ):
+        s_be, _, _ = verify_evidence_against_telemetry(
+            AgentEvidenceInput(
+                source_file="data/orders.csv",
+                evidence_type="schema_diff",
+                column_name="amount",
+                tool_execution_id="TE-SCH-TM",
+                observation=bad_exp,
+            ),
+            files, [te_schema], investigation_id="INV-TM",
+        )
+        assert s_be == "unverified", f"Expected unverified for wrong expected type: {bad_exp}"
+
+    # 4. Incorrect actual type -> unverified
+    for bad_act in (
+        "The amount column has a type mismatch: expected float64, actual int64.",
+        "The amount column has a type mismatch: expected float64, actual string.",
+        "The amount column has a type mismatch: expected float64, actual varchar.",
+        "The amount column has a type mismatch: actual float64.",
+    ):
+        s_ba, _, _ = verify_evidence_against_telemetry(
+            AgentEvidenceInput(
+                source_file="data/orders.csv",
+                evidence_type="schema_diff",
+                column_name="amount",
+                tool_execution_id="TE-SCH-TM",
+                observation=bad_act,
+            ),
+            files, [te_schema], investigation_id="INV-TM",
+        )
+        assert s_ba == "unverified", f"Expected unverified for wrong actual type: {bad_act}"
+
+    # 5. Narrower valid claims mentioning only one role -> verified
+    s_exp_only, inf_exp, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="schema_diff",
+            column_name="amount",
+            tool_execution_id="TE-SCH-TM",
+            observation="The amount column has a type mismatch: expected float64.",
+        ),
+        files, [te_schema], investigation_id="INV-TM",
+    )
+    assert s_exp_only == "verified" and inf_exp is False
+
+    s_act_only, inf_act, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="data/orders.csv",
+            evidence_type="schema_diff",
+            column_name="amount",
+            tool_execution_id="TE-SCH-TM",
+            observation="The amount column has a type mismatch: actual object.",
+        ),
+        files, [te_schema], investigation_id="INV-TM",
+    )
+    assert s_act_only == "verified" and inf_act is False
+
+    # 6. Ambiguous / role-less / cross-column / negated claims -> unverified
+    for ambig_obs in (
+        "The amount column has a type mismatch between float64 and object.",
+        "The amount column has a type mismatch involving float64.",
+        "The amount column has a type mismatch: expected float64 or int64, actual object.",
+        "The amount column has a type mismatch: expected type is not float64, actual object.",
+        "The amount column has a type mismatch: expected int64, actual str.",
+        "amount and quantity have a type mismatch: expected float64, actual object.",
+    ):
+        s_amb, _, _ = verify_evidence_against_telemetry(
+            AgentEvidenceInput(
+                source_file="data/orders.csv",
+                evidence_type="schema_diff",
+                column_name="amount",
+                tool_execution_id="TE-SCH-TM",
+                observation=ambig_obs,
+            ),
+            files, [te_schema], investigation_id="INV-TM",
+        )
+        assert s_amb == "unverified", f"Expected unverified for ambiguous/cross-col claim: {ambig_obs}"
+
+
+def test_schema_type_mismatch_incomplete_telemetry_fails_closed():
+    """
+    Missing expected_dtype or actual_dtype in schema telemetry must fail closed
+    rather than verifying claims without backing field data.
+    """
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="data/orders.csv", file_type="data", size_bytes=100, storage_path="/tmp/f1")
+    ]
+    incomplete_payloads = [
+        {"differences": {"type_mismatches": [{"column": "amount", "expected_dtype": "float64"}]}},
+        {"differences": {"type_mismatches": [{"column": "amount", "expected_dtype": "float64", "actual_dtype": None}]}},
+        {"differences": {"type_mismatches": [{"column": "amount", "actual_dtype": "object"}]}},
+        {"differences": {"type_mismatches": [{"column": "amount"}]}},
+        {"type_mismatches": ["amount"]},
+    ]
+    candidate_obs = [
+        "The amount column has a type mismatch: expected float64, actual object.",
+        "The amount column has a type mismatch: expected float64.",
+        "The amount column has a type mismatch: actual object.",
+        "The amount column has a type mismatch.",
+    ]
+
+    for idx, payload in enumerate(incomplete_payloads):
+        te = ToolExecution(
+            id=f"TE-INC-{idx}",
+            investigation_id="INV-INC-TM",
+            tool_name="inspect_schema",
+            status="success",
+            output_result=payload,
+        )
+        for obs in candidate_obs:
+            status, _, _ = verify_evidence_against_telemetry(
+                AgentEvidenceInput(
+                    source_file="data/orders.csv",
+                    evidence_type="schema_diff",
+                    column_name="amount",
+                    tool_execution_id=f"TE-INC-{idx}",
+                    observation=obs,
+                ),
+                files, [te], investigation_id="INV-INC-TM",
+            )
+            assert status != "verified"
+            assert status == "unverified"
+
+
+@pytest.mark.asyncio
+async def test_schema_type_mismatch_real_inspect_schema_tool_end_to_end(tmp_path: Path):
+    """
+    Runs the actual InspectSchemaTool on baseline and drifted CSV datasets and
+    verifies role-preserving checks against the real generated output shape.
+    """
+    from backend.app.tools.inspect_schema import InspectSchemaTool
+
+    (tmp_path / "baseline.csv").write_text(
+        "id,amount\n1,10.5\n2,20.0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "current.csv").write_text(
+        "id,amount\n1,ten_dollars\n2,twenty_dollars\n",
+        encoding="utf-8",
+    )
+
+    files = [
+        ProjectFile(id="f1", project_id="p1", relative_path="current.csv", file_type="data", size_bytes=100, storage_path=str(tmp_path / "current.csv")),
+    ]
+    res = await InspectSchemaTool().execute(str(tmp_path), {"dataset_path": "current.csv", "baseline_path": "baseline.csv"})
+    assert res.success is True
+    assert any(
+        tm["column"] == "amount" and tm["expected_dtype"] == "float64" and tm["actual_dtype"] == "object"
+        for tm in res.data["differences"]["type_mismatches"]
+    )
+
+    te = ToolExecution(
+        id="E-REAL-TM",
+        investigation_id="INV-REAL-TM",
+        tool_name="inspect_schema",
+        status="success",
+        output_result=res.data,
+    )
+
+    # Exact roles -> verified
+    s_ok, inf_ok, tid_ok = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="current.csv",
+            evidence_type="schema_diff",
+            column_name="amount",
+            observation="The amount column has a type mismatch: expected float64, actual object.",
+        ),
+        files, [te], investigation_id="INV-REAL-TM", workspace_dir=tmp_path,
+    )
+    assert s_ok == "verified" and inf_ok is False and tid_ok == "E-REAL-TM"
+
+    # Expected-only narrower claim -> verified
+    s_exp, inf_exp, _ = verify_evidence_against_telemetry(
+        AgentEvidenceInput(
+            source_file="current.csv",
+            evidence_type="schema_diff",
+            column_name="amount",
+            observation="The amount column has a type mismatch: expected float64.",
+        ),
+        files, [te], investigation_id="INV-REAL-TM", workspace_dir=tmp_path,
+    )
+    assert s_exp == "verified" and inf_exp is False
+
+    # Reversed, incorrect expected, incorrect actual -> unverified
+    for bad_obs in (
+        "The amount column has a type mismatch: expected object, actual float64.",
+        "The amount column has a type mismatch: expected int64, actual object.",
+        "The amount column has a type mismatch: expected float64, actual int64.",
+    ):
+        s_bad, _, _ = verify_evidence_against_telemetry(
+            AgentEvidenceInput(
+                source_file="current.csv",
+                evidence_type="schema_diff",
+                column_name="amount",
+                observation=bad_obs,
+            ),
+            files, [te], investigation_id="INV-REAL-TM", workspace_dir=tmp_path,
+        )
+        assert s_bad == "unverified"
+
+
+
 
 

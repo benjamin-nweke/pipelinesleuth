@@ -1026,6 +1026,135 @@ def _verify_dependency_telemetry(
     return "unverified", False, None
 
 
+def _extract_schema_dtype_claims(
+    obs_lower: str,
+    all_known_dtypes: set[str],
+    exclude_col_tokens: set[str]
+) -> Optional[Tuple[List[str], List[str], set[str]]]:
+    """
+    Extracts role-bound expected and actual dtype claims plus any unbound dtype mentions.
+    Returns None if the observation contains explicit negation or multi-option ambiguity.
+    """
+    if (
+        re.search(r'\b(?:no|not|never)\s+(?:a\s+)?(?:type|dtype)\s+mismatch\b', obs_lower)
+        or re.search(r'\b(?:expected|actual|observed|current)(?:\s+(?:data\s+)?)?(?:dtype|type)?\s+(?:is|was|are)\s+not\b', obs_lower)
+        or re.search(r'\b(?:expected_dtype|actual_dtype)\s+(?:is|was|are)\s+not\b', obs_lower)
+        or re.search(r'\bnot\s+(?:expected|actual|observed)\b', obs_lower)
+        or re.search(r'\b(?:either|neither)\b', obs_lower)
+    ):
+        return None
+
+    non_dtype_stopwords = {
+        "type", "types", "dtype", "dtypes", "data", "column", "columns", "field", "fields",
+        "mismatch", "mismatches", "conflict", "drift", "error", "incompatibility",
+        "is", "was", "are", "be", "to", "not", "of", "as", "in", "on", "for", "from", "with",
+        "and", "or", "but", "vs", "versus", "the", "a", "an", "instead", "rather", "than",
+        "actual", "actually", "actual_dtype", "expected", "expected_dtype", "observed",
+        "current", "baseline", "found", "got", "received", "schema", "value", "values",
+        "between", "involving"
+    } | exclude_col_tokens
+
+    dtype_tok_re = r"([a-zA-Z][a-zA-Z0-9_]*(?:\[[a-zA-Z0-9_]+\])?)(?![a-zA-Z0-9_\[])"
+
+    # Reject ambiguous disjunctions like "float64 or int64" / "object / string"
+    for m_or in re.finditer(dtype_tok_re + r"[)'\"`]?\s*(?:\bor\b|/)\s*['\"`]?" + dtype_tok_re, obs_lower):
+        t1, t2 = m_or.group(1).lower(), m_or.group(2).lower()
+        if (t1 in all_known_dtypes or t2 in all_known_dtypes) and t1 not in non_dtype_stopwords and t2 not in non_dtype_stopwords:
+            return None
+
+    bound_spans: List[Tuple[int, int]] = []
+    claimed_expected: List[str] = []
+    claimed_actual: List[Tuple[str, int, int]] = []
+
+    def _span_overlaps(start: int, end: int) -> bool:
+        return any(not (end <= bs or start >= be) for bs, be in bound_spans)
+
+    # 1. Explicit expected role markers
+    exp_pattern = re.compile(
+        r"\b(?:expected(?:\s+(?:data\s+)?)?(?:dtype|type)|expected_dtype|expected"
+        r"|baseline(?:\s+(?:data\s+)?)?(?:dtype|type)|baseline_dtype|should\s+be)"
+        r"(?:\s*[:=]\s*|\s+(?:(?:is|was|are|of|as|to\s+be)\s+)?)[('\"`]?"
+        + dtype_tok_re
+    )
+    for m in exp_pattern.finditer(obs_lower):
+        tok = m.group(1).lower()
+        s, e = m.span(1)
+        if tok in non_dtype_stopwords or _span_overlaps(s, e):
+            continue
+        bound_spans.append((s, e))
+        claimed_expected.append(tok)
+
+    # 2. Explicit actual role markers
+    act_pattern = re.compile(
+        r"\b(actual(?:ly)?(?:\s+(?:data\s+)?)?(?:dtype|type)|actual_dtype|actual"
+        r"|observed(?:\s+(?:data\s+)?)?(?:dtype|type)|observed_dtype"
+        r"|current(?:\s+(?:data\s+)?)?(?:dtype|type)|current_dtype"
+        r"|(?:got|received)(?:\s+(?:data\s+)?(?:dtype|type))?"
+        r"|found(?:\s+(?:data\s+)?(?:dtype|type))?)"
+        r"(?:\s*[:=]\s*|\s+(?:(?:is|was|are|of|as|to\s+be)\s+)?)[('\"`]?"
+        + dtype_tok_re
+    )
+    for m in act_pattern.finditer(obs_lower):
+        prefix = m.group(1).lower()
+        tok = m.group(2).lower()
+        s, e = m.span(2)
+        if tok in non_dtype_stopwords or _span_overlaps(s, e):
+            continue
+        if prefix.startswith("found"):
+            pre_ctx = obs_lower[max(0, m.start(1) - 8):m.start(1)]
+            if re.search(r'\bnot\s+$', pre_ctx):
+                continue
+            if "dtype" not in prefix and "type" not in prefix and tok not in all_known_dtypes:
+                continue
+        bound_spans.append((s, e))
+        claimed_actual.append((tok, s, e))
+
+    # 3. Post-positional role labels: "float64 expected, object actual"
+    post_pattern = re.compile(dtype_tok_re + r"[)'\"`]?\s+(?:is\s+)?(expected|actual)\b")
+    for m in post_pattern.finditer(obs_lower):
+        tok = m.group(1).lower()
+        role = m.group(2).lower()
+        s, e = m.span(1)
+        if tok in non_dtype_stopwords or _span_overlaps(s, e):
+            continue
+        bound_spans.append((s, e))
+        if role == "expected":
+            claimed_expected.append(tok)
+        else:
+            claimed_actual.append((tok, s, e))
+
+    # 4. Comparative form: "<actual> instead of / rather than <expected>"
+    actual_spans = {(s, e) for _, s, e in claimed_actual}
+    comp_pattern = re.compile(
+        dtype_tok_re + r"[)'\"`]?\s+(?:instead\s+of|rather\s+than)\s+['\"`]?" + dtype_tok_re
+    )
+    for m in comp_pattern.finditer(obs_lower):
+        tok_l, tok_r = m.group(1).lower(), m.group(2).lower()
+        sl, el = m.span(1)
+        sr, er = m.span(2)
+        if tok_l in non_dtype_stopwords or tok_r in non_dtype_stopwords:
+            continue
+        if not _span_overlaps(sl, el) and not _span_overlaps(sr, er):
+            bound_spans.extend([(sl, el), (sr, er)])
+            claimed_actual.append((tok_l, sl, el))
+            claimed_expected.append(tok_r)
+        elif (sl, el) in actual_spans and not _span_overlaps(sr, er):
+            bound_spans.append((sr, er))
+            claimed_expected.append(tok_r)
+
+    # 5. Collect any remaining dtype tokens not explicitly bound to expected or actual
+    unbound_dtypes: set[str] = set()
+    for m in re.finditer(r"(?<![a-zA-Z0-9_])" + dtype_tok_re, obs_lower):
+        tok = m.group(1).lower()
+        s, e = m.span(1)
+        if _span_overlaps(s, e):
+            continue
+        if tok in all_known_dtypes and tok not in exclude_col_tokens:
+            unbound_dtypes.add(tok)
+
+    return claimed_expected, [tok for tok, _, _ in claimed_actual], unbound_dtypes
+
+
 def _verify_schema_telemetry(
     ev_input: AgentEvidenceInput,
     src_norm: str,
@@ -1035,6 +1164,7 @@ def _verify_schema_telemetry(
     """
     Verifies schema inspection evidence binding columns to their actual
     missing, added, renamed, or type-mismatched status in the schema diff.
+    Preserves exact expected_dtype vs actual_dtype role mapping.
     """
     obs_lower = ev_input.observation.lower()
 
@@ -1048,14 +1178,21 @@ def _verify_schema_telemetry(
 
     type_mismatches = differences.get("type_mismatches") or out_data.get("type_mismatches") or []
     type_mismatch_map: Dict[str, Dict[str, str]] = {}
-    for tm in type_mismatches:
-        if isinstance(tm, dict) and "column" in tm:
-            type_mismatch_map[str(tm["column"]).lower()] = {
-                "expected": str(tm.get("expected_dtype", "")).lower(),
-                "actual": str(tm.get("actual_dtype", "")).lower()
-            }
-        elif isinstance(tm, str):
-            type_mismatch_map[tm.lower()] = {}
+    if isinstance(type_mismatches, list):
+        for tm in type_mismatches:
+            if isinstance(tm, dict) and tm.get("column"):
+                exp_val = tm.get("expected_dtype")
+                if exp_val is None:
+                    exp_val = tm.get("expected")
+                act_val = tm.get("actual_dtype")
+                if act_val is None:
+                    act_val = tm.get("actual")
+                type_mismatch_map[str(tm["column"]).lower()] = {
+                    "expected": str(exp_val).strip().lower() if exp_val else "",
+                    "actual": str(act_val).strip().lower() if act_val else "",
+                }
+            elif isinstance(tm, str) and tm.strip():
+                type_mismatch_map[tm.strip().lower()] = {"expected": "", "actual": ""}
 
     renamed_candidates = differences.get("renamed_candidates") or []
     renamed_pairs: List[Tuple[str, str]] = []
@@ -1069,12 +1206,12 @@ def _verify_schema_telemetry(
             present_cols.setdefault(str(c).lower(), "")
         if isinstance(target_schema.get("fields"), dict):
             for c, fmeta in target_schema["fields"].items():
-                dtype_str = str(fmeta.get("dtype", "")).lower() if isinstance(fmeta, dict) else ""
+                dtype_str = str(fmeta.get("dtype", "")).lower() if isinstance(fmeta, dict) and fmeta.get("dtype") else ""
                 present_cols[str(c).lower()] = dtype_str
     if actual_schema:
         if isinstance(actual_schema, dict):
             for c, dtype_val in actual_schema.items():
-                present_cols[str(c).lower()] = str(dtype_val).lower()
+                present_cols[str(c).lower()] = str(dtype_val).lower() if dtype_val else ""
         elif isinstance(actual_schema, list):
             for c in actual_schema:
                 present_cols.setdefault(str(c).lower(), "")
@@ -1083,8 +1220,9 @@ def _verify_schema_telemetry(
         return "unverified", False, None
 
     all_cols = missing_cols | new_cols | drift_cols | set(type_mismatch_map.keys()) | set(present_cols.keys())
+    all_cols_sorted = sorted(all_cols)
     words_in_obs = set(re.findall(r'[a-zA-Z0-9_]+', obs_lower))
-    mentioned_cols = [c for c in all_cols if c in words_in_obs]
+    mentioned_cols = [c for c in all_cols_sorted if re.search(r'\b' + re.escape(c) + r'\b', obs_lower)]
 
     explicit_col = ev_input.column_name.lower() if ev_input.column_name else None
     if explicit_col and mentioned_cols and explicit_col not in mentioned_cols:
@@ -1094,10 +1232,44 @@ def _verify_schema_telemetry(
     if not claimed_col:
         return "unverified", False, None
 
+    base_known_dtypes = {
+        "int64", "int32", "int16", "int8", "uint64", "uint32", "uint16", "uint8", "int", "integer", "bigint", "smallint",
+        "float64", "float32", "float16", "float", "double", "decimal", "numeric", "number",
+        "object", "string", "str", "varchar", "char", "text",
+        "bool", "boolean",
+        "datetime", "datetime64", "datetime64[ns]", "timestamp", "date", "time", "timedelta", "timedelta64",
+        "category", "categorical", "json", "bytes", "binary",
+    }
+
     is_missing_claim = any(kw in obs_lower for kw in ("missing", "dropped", "removed", "not found", "lacking", "omitted"))
-    is_type_claim = any(kw in obs_lower for kw in ("type mismatch", "wrong type", "incompatible type", "expected type", "cast error"))
     is_rename_claim = any(kw in obs_lower for kw in ("renamed", "rename"))
     is_new_claim = any(kw in obs_lower for kw in ("added", "new column", "unexpected column", "extra column"))
+    is_explicit_mismatch_phrase = any(kw in obs_lower for kw in (
+        "type mismatch", "dtype mismatch", "mismatched type", "mismatched dtype",
+        "wrong type", "wrong dtype", "incompatible type", "incompatible dtype",
+        "type incompatibility", "type conflict", "type drift", "cast error",
+        "expected_dtype", "actual_dtype", "expected type", "expected dtype",
+        "actual type", "actual dtype", "observed type", "observed dtype",
+        "current type", "current dtype"
+    ))
+    has_role_dtype_pair = bool(re.search(r'\bexpected\b.+\bactual\b|\bactual\b.+\bexpected\b', obs_lower))
+    is_type_claim = bool(
+        is_explicit_mismatch_phrase
+        or has_role_dtype_pair
+        or (
+            not is_missing_claim and not is_new_claim and not is_rename_claim
+            and (
+                re.search(r'\b(?:expected|actual|observed)(?:_?(?:dtype|type))?\b', obs_lower)
+                or (
+                    (
+                        re.search(r'\b(?:dtype|data\s*type)\b', obs_lower)
+                        or bool(words_in_obs & (base_known_dtypes - all_cols))
+                    )
+                    and claimed_col in type_mismatch_map
+                )
+            )
+        )
+    )
 
     allowed_terms = {claimed_col} | set(re.findall(r'[a-zA-Z0-9_]{2,}', src_norm.lower()))
     matched = False
@@ -1112,7 +1284,7 @@ def _verify_schema_telemetry(
         if not matched:
             return "unverified", False, None
 
-    elif is_missing_claim:
+    elif is_missing_claim and not is_explicit_mismatch_phrase:
         if claimed_col in present_cols and claimed_col not in missing_cols:
             return "unverified", False, None
         if claimed_col in missing_cols or claimed_col in drift_cols:
@@ -1122,23 +1294,43 @@ def _verify_schema_telemetry(
             return "unverified", False, None
 
     elif is_type_claim:
-        if claimed_col in type_mismatch_map:
-            tm_info = type_mismatch_map[claimed_col]
+        target_type_cols = mentioned_cols if mentioned_cols else [claimed_col]
+        all_known_dtypes = set(base_known_dtypes)
+        for col_c in target_type_cols:
+            tm_info = type_mismatch_map.get(col_c)
+            if not tm_info:
+                return "unverified", False, None
+            if tm_info.get("expected"):
+                all_known_dtypes.add(tm_info["expected"])
+            if tm_info.get("actual"):
+                all_known_dtypes.add(tm_info["actual"])
+
+        extracted = _extract_schema_dtype_claims(obs_lower, all_known_dtypes, all_cols)
+        if extracted is None:
+            return "unverified", False, None
+        claimed_expected, claimed_actual, unbound_dtypes = extracted
+
+        # Any dtype mentioned without a clear expected/actual role is ambiguous -> fail closed
+        if unbound_dtypes:
+            return "unverified", False, None
+
+        for col_c in target_type_cols:
+            tm_info = type_mismatch_map[col_c]
             expected_t = tm_info.get("expected", "")
             actual_t = tm_info.get("actual", "")
-            known_dtypes = {"int64", "float64", "object", "bool", "datetime", "datetime64", "string", "str", "int", "float"}
-            mentioned_dtypes = words_in_obs & known_dtypes
-            expected_allowed = {t for t in (expected_t, actual_t) if t}
-            if mentioned_dtypes and expected_allowed and not mentioned_dtypes.issubset(expected_allowed):
+            # Fail closed if type mismatch telemetry is incomplete or non-distinct
+            if not expected_t or not actual_t or expected_t == actual_t:
                 return "unverified", False, None
-            if expected_t:
-                allowed_terms.add(expected_t)
-            if actual_t:
-                allowed_terms.add(actual_t)
-            matched = True
-            valid_schema_nums.add(str(len(type_mismatch_map)))
-        else:
-            return "unverified", False, None
+            if any(ce != expected_t for ce in claimed_expected):
+                return "unverified", False, None
+            if any(ca != actual_t for ca in claimed_actual):
+                return "unverified", False, None
+
+            allowed_terms.update({col_c, expected_t, actual_t})
+
+        allowed_terms.update({"expected_dtype", "actual_dtype", "got", "received", "baseline", "current", "instead", "rather", "than"})
+        matched = True
+        valid_schema_nums.add(str(len(type_mismatch_map)))
 
     elif is_new_claim:
         if claimed_col in new_cols or claimed_col in drift_cols:
@@ -1148,10 +1340,19 @@ def _verify_schema_telemetry(
             return "unverified", False, None
 
     else:
-        if claimed_col in (missing_cols | new_cols | drift_cols | set(type_mismatch_map.keys())):
+        if claimed_col in (missing_cols | new_cols | drift_cols):
+            matched = True
+        elif claimed_col in type_mismatch_map:
+            tm_info = type_mismatch_map[claimed_col]
+            if not tm_info.get("expected") or not tm_info.get("actual"):
+                return "unverified", False, None
             matched = True
         elif claimed_col in present_cols and present_cols[claimed_col] and present_cols[claimed_col] in obs_lower:
-            allowed_terms.add(present_cols[claimed_col])
+            col_dtype = present_cols[claimed_col]
+            extra_dtypes = (words_in_obs & (base_known_dtypes - all_cols)) - {col_dtype}
+            if extra_dtypes:
+                return "unverified", False, None
+            allowed_terms.add(col_dtype)
             matched = True
         else:
             return "unverified", False, None
