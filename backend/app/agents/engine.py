@@ -1966,6 +1966,9 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
                             "duration_ms": tool_res.execution_time_ms
                         }
                     )
+                    if tool_name == "propose_patch" and tool_res.success and isinstance(tool_res.data, dict):
+                        await self._persist_proposed_patch(investigation, tool_res.data)
+                        return
                     continue
 
             if action == "propose_patch" and decision.patch_proposal:
@@ -1987,35 +1990,7 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
                 )
 
                 if patch_tool_res.success:
-                    p_data = patch_tool_res.data
-                    proposal = PatchProposal(
-                        investigation_id=self.investigation_id,
-                        target_file=p_data["target_file"],
-                        original_code_context=p_data["original_code_context"],
-                        proposed_code=p_data["proposed_code"],
-                        unified_diff=p_data["unified_diff"],
-                        explanation=p_data["explanation"],
-                        supporting_evidence_ids=p_data["supporting_evidence_ids"],
-                        expected_impact=p_data["expected_impact"],
-                        potential_risks=p_data["potential_risks"],
-                        status="proposed"
-                    )
-                    self.db.add(proposal)
-                    investigation.status = "awaiting_patch_approval"
-                    investigation.stage = "awaiting_approval"
-                    await self.db.commit()
-                    await self.db.refresh(proposal)
-
-                    await self.emit_event(
-                        "patch_generated",
-                        f"Proposed Code Correction: {proposal.target_file}",
-                        {
-                            "patch_id": proposal.id,
-                            "target_file": proposal.target_file,
-                            "explanation": proposal.explanation,
-                            "unified_diff": proposal.unified_diff
-                        }
-                    )
+                    await self._persist_proposed_patch(investigation, patch_tool_res.data)
                     # Await human review and approval
                     return
                 else:
@@ -2053,6 +2028,41 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
         investigation.stage = "report_generation"
         await self.db.commit()
         await self._build_final_report(None, False)
+
+    async def _persist_proposed_patch(
+        self,
+        investigation: Investigation,
+        p_data: Dict[str, Any],
+    ) -> None:
+        """Persists a verified PatchProposal and pauses investigation for human approval."""
+        proposal = PatchProposal(
+            investigation_id=self.investigation_id,
+            target_file=p_data["target_file"],
+            original_code_context=p_data["original_code_context"],
+            proposed_code=p_data["proposed_code"],
+            unified_diff=p_data["unified_diff"],
+            explanation=p_data["explanation"],
+            supporting_evidence_ids=p_data.get("supporting_evidence_ids", []),
+            expected_impact=p_data["expected_impact"],
+            potential_risks=p_data["potential_risks"],
+            status="proposed",
+        )
+        self.db.add(proposal)
+        investigation.status = "awaiting_patch_approval"
+        investigation.stage = "awaiting_approval"
+        await self.db.commit()
+        await self.db.refresh(proposal)
+
+        await self.emit_event(
+            "patch_generated",
+            f"Proposed Code Correction: {proposal.target_file}",
+            {
+                "patch_id": proposal.id,
+                "target_file": proposal.target_file,
+                "explanation": proposal.explanation,
+                "unified_diff": proposal.unified_diff,
+            },
+        )
 
     async def _build_final_report(self, rep_input: Optional[Any], is_success: bool) -> None:
         """Constructs and stores the final markdown investigation report."""

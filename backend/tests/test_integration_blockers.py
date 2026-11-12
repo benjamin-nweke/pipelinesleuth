@@ -1115,3 +1115,74 @@ async def test_background_validation_system_error_generates_failed_report(tmp_pa
         assert rep.validation_summary["status"] == "failed"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_call_tool_propose_patch_persists_proposal_and_pauses_at_gate(
+    tmp_path: Path, monkeypatch
+):
+    engine, session_factory = await _create_isolated_db(tmp_path / "call_tool_patch.db")
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    monkeypatch.setattr(settings, "UPLOADS_DIR", uploads_dir)
+
+    class _CallToolProposePatchAI(AIProvider):
+        async def generate_decision(self, prompt: str, system_instruction: str = "", temperature: float = 0.2):
+            return AgentDecision(
+                investigation_summary=InvestigationSummary(
+                    investigation_focus="Propose patch using propose_patch tool call",
+                    tool_selection_reason="Invoke propose_patch tool directly",
+                    finding_summary="Zero division bug isolated",
+                    hypothesis_impact="Confirmed",
+                    next_steps="Await human patch approval",
+                ),
+                current_stage="patch_generation",
+                action_type="call_tool",
+                tool_call=ToolCallRequest(
+                    tool_name="propose_patch",
+                    arguments={
+                        "target_file": "pipeline.py",
+                        "original_snippet": "    return total / count",
+                        "replacement_code": "    return total / count if count else 0.0",
+                        "explanation": "Handle count == 0",
+                        "supporting_evidence_ids": [],
+                        "expected_impact": "Avoids ZeroDivisionError",
+                        "potential_risks": "Returns 0.0 for zero denominator",
+                    },
+                ),
+                confidence_score=0.95,
+                confidence_justification="Direct fix ready for approval",
+            )
+
+    async with session_factory() as db:
+        proj, _ = await _seed_project_with_bug(db, uploads_dir, project_id="proj-calltool-patch")
+        inv = Investigation(project_id=proj.id, objective="Fix compute_ratio via call_tool")
+        db.add(inv)
+        await db.commit()
+
+        inv_engine = InvestigationEngine(
+            db=db,
+            investigation_id=inv.id,
+            ai_provider=_CallToolProposePatchAI(),
+        )
+        await inv_engine.run()
+
+        await db.refresh(inv)
+        assert inv.status == "awaiting_patch_approval"
+        assert inv.stage == "awaiting_approval"
+
+        patches = (
+            await db.execute(select(PatchProposal).where(PatchProposal.investigation_id == inv.id))
+        ).scalars().all()
+        assert len(patches) == 1
+        assert patches[0].status == "proposed"
+        assert "if count else 0.0" in patches[0].proposed_code
+
+        reports = (
+            await db.execute(
+                select(InvestigationReport).where(InvestigationReport.investigation_id == inv.id)
+            )
+        ).scalars().all()
+        assert reports == []
+
+    await engine.dispose()
