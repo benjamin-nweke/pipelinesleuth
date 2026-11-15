@@ -34,6 +34,8 @@ class AIProvider:
         self.openai_base_url = (openai_base_url or settings.OPENAI_BASE_URL).rstrip("/")
         self.openai_api_key = openai_api_key or settings.OPENAI_API_KEY
         self.openai_model = openai_model or settings.OPENAI_MODEL
+        if self.openai_model in ("gpt-4.1-mini", "4.1-mini"):
+            self.openai_model = "gpt-4o-mini"
 
     async def test_connectivity(self) -> Tuple[bool, str, int]:
         """
@@ -150,6 +152,7 @@ class AIProvider:
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": temperature,
+                    "max_tokens": 2048,
                     "response_format": {"type": "json_object"}
                 }
                 resp = await client.post(f"{self.openai_base_url}/chat/completions", headers=headers, json=payload)

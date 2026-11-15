@@ -122,7 +122,7 @@ Configure `.env` or navigate to `/settings` in the UI to set your API endpoint a
 AI_PROVIDER=openai
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o
+OPENAI_MODEL=gpt-4o-mini
 ```
 
 ### 3. Start PipelineSleuth

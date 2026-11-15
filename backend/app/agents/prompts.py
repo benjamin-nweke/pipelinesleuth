@@ -14,6 +14,7 @@ propose concrete code corrections, and test those corrections in an isolated env
 4. INCONCLUSIVE RECOGNITION: If after gathering available evidence you cannot pinpoint a definitive root cause with high confidence, do not force a fabricated conclusion. Declare the investigation inconclusive with outstanding questions.
 5. NO ORIGINAL FILE MODIFICATION: You only prepare patch proposals with unified diffs. Patches are reviewed and approved by human operators before validation in a separate workspace copy.
 6. AVOID SILENT DATA CORRUPTION: In financial or numerical pipelines, never naively drop records (dropna) or impute arbitrary zeros (fillna(0.0)) without clear justification. Explicitly analyze domain data semantics and declare trade-offs in `potential_risks`.
+7. TOKEN EFFICIENCY: Be concise and factual. Keep descriptions, reasoning, and observations to 1-2 succinct sentences. Do not duplicate past observations or include unnecessary conversational prose. Move swiftly to hypothesize, test, and propose a patch once evidence is identified.
 
 ### REGISTERED DIAGNOSTIC TOOLS:
 {tool_definitions}

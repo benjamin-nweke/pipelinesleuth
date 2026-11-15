@@ -1727,15 +1727,15 @@ class InvestigationEngine:
                 select(ToolExecution)
                 .where(ToolExecution.investigation_id == self.investigation_id)
                 .order_by(ToolExecution.created_at.desc())
-                .limit(6)
+                .limit(4)
             )
             recent_tool_execs = list(tool_exec_result.scalars().all())
             recent_tool_execs.reverse()
             recent_tools_summary = []
             for te in recent_tool_execs:
-                output_str = json.dumps(te.output_result) if te.output_result else ""
-                if len(output_str) > 1200:
-                    output_str = output_str[:1200] + "... [truncated]"
+                output_str = json.dumps(te.output_result, separators=(',', ':')) if te.output_result else ""
+                if len(output_str) > 800:
+                    output_str = output_str[:800] + "... [truncated]"
                 recent_tools_summary.append({
                     "tool": te.tool_name,
                     "arguments": te.input_arguments,
@@ -1744,21 +1744,17 @@ class InvestigationEngine:
                     "result_summary": output_str
                 })
 
-            # Construct agent prompt
+            # Construct concise agent prompt (token-conserving, references state in system instruction)
             prompt_content = f"""
 Current Investigation Context:
-- Project ID: {project.id}
-- Project Name: {project.name}
+- Project: {project.name} (ID: {project.id})
 - Pipeline Objective: {investigation.objective}
 - Project Files: {project_files_summary}
 - Remaining Budget: {investigation.remaining_budget} steps
 - Current Stage: {investigation.stage}
-- Hypotheses Formulated: {json.dumps(hyp_summary)}
-- Evidence Records Logged: {json.dumps(evd_summary)}
-- Recent Diagnostic Tool Outputs: {json.dumps(recent_tools_summary, indent=2)}
+- Hypotheses Count: {len(hyp_summary)} | Evidence Records Count: {len(evd_summary)}
 
-Inspect the available data, empirical tool findings, and decide whether to call a diagnostic tool,
-formulate/test hypotheses, propose a patch, or conclude the investigation. Output pure JSON.
+Inspect the available data and empirical tool findings in state, decide the next action (call_tool, propose_patch, or conclude), and output pure JSON matching AgentDecision.
 """
 
             system_instruction = INVESTIGATION_SYSTEM_PROMPT.format(
@@ -1770,7 +1766,7 @@ formulate/test hypotheses, propose a patch, or conclude the investigation. Outpu
                 remaining_budget=investigation.remaining_budget,
                 active_hypotheses=json.dumps(hyp_summary),
                 collected_evidence=json.dumps(evd_summary),
-                recent_tool_history=json.dumps(recent_tools_summary, indent=2)
+                recent_tool_history=json.dumps(recent_tools_summary, indent=1)
             )
 
             # Call AI model provider
