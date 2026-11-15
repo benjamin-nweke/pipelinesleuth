@@ -9,6 +9,7 @@ if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
+export PATH="$HOME/.docker/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 export PYTHONPATH="$ROOT_DIR"
 
 echo "=========================================================="

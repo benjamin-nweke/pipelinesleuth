@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from backend.app.core.config import settings
 
+# Ensure standard Docker binary locations on macOS/Linux are present in PATH for subprocess execution
+for _p in [str(Path.home() / ".docker" / "bin"), "/usr/local/bin", "/opt/homebrew/bin"]:
+    if os.path.isdir(_p) and _p not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = f"{_p}{os.pathsep}{os.environ.get('PATH', '')}"
+
 
 class SandboxManager:
     def __init__(self):
