@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     INVESTIGATION_TIMEOUT_SECONDS: int = 300
 
     # Sandbox Execution Settings
-    DOCKER_IMAGE: str = "python:3.11-slim"
+    DOCKER_IMAGE: str = "pipelinesleuth-sandbox:latest"
     SANDBOX_TIMEOUT_SECONDS: int = 60
     SANDBOX_MEMORY_LIMIT: str = "1g"
     SANDBOX_CPU_QUOTA: int = 100000  # 1 CPU
