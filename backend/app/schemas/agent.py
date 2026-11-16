@@ -2,7 +2,7 @@
 Structured Pydantic models for Agent Actions, Reasoning, and Decision Making
 """
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ToolCallRequest(BaseModel):
@@ -104,4 +104,11 @@ class AgentDecision(BaseModel):
     
     confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Overall confidence in root cause diagnosis")
     confidence_justification: str = Field("", description="Why this confidence score is warranted by collected evidence")
+
+    @field_validator("tool_call", "patch_proposal", "final_report", mode="before")
+    @classmethod
+    def empty_dict_to_none(cls, v):
+        if isinstance(v, dict) and not v:
+            return None
+        return v
 
