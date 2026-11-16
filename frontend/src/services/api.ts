@@ -118,12 +118,25 @@ export async function handlePatchAction(
   action: 'approve' | 'reject',
   reason?: string
 ): Promise<PatchProposal> {
+  let headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...getOperatorAuthHeader()
+  };
+
+  // If no operator authorization token is stored in localStorage, prompt operator
+  if (!headers['Authorization']) {
+    const inputKey = window.prompt(
+      'Operator Authorization Required:\nPlease enter your OPERATOR_API_KEY to authorize this patch action:'
+    );
+    if (inputKey && inputKey.trim()) {
+      localStorage.setItem('pipelinesleuth_operator_key', inputKey.trim());
+      headers['Authorization'] = `Bearer ${inputKey.trim()}`;
+    }
+  }
+
   const res = await fetch(`${API_BASE}/investigations/${investigationId}/patches/${patchId}/action`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...getOperatorAuthHeader()
-    },
+    headers,
     body: JSON.stringify({ action, reason }),
   });
   if (!res.ok) {
