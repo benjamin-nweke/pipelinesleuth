@@ -9,6 +9,13 @@ class ToolCallRequest(BaseModel):
     tool_name: str = Field(..., description="The name of the registered diagnostic tool to call")
     arguments: Dict[str, Any] = Field(default_factory=dict, description="Arguments to pass to the tool")
 
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def none_to_empty_dict(cls, v):
+        if v is None:
+            return {}
+        return v
+
 
 class AgentEvidenceInput(BaseModel):
     source_file: str = Field(..., description="File path from which evidence was observed")
@@ -41,6 +48,13 @@ class AgentPatchInput(BaseModel):
     expected_impact: str = Field(..., description="Expected behavior of pipeline after fix")
     potential_risks: str = Field(..., description="Potential edge cases, regressions or side effects")
 
+    @field_validator("supporting_evidence_ids", mode="before")
+    @classmethod
+    def none_to_empty_list(cls, v):
+        if v is None:
+            return []
+        return v
+
 
 class AgentReportInput(BaseModel):
     title: str = Field(..., description="Title of final diagnostic report")
@@ -49,6 +63,13 @@ class AgentReportInput(BaseModel):
     affected_components: List[str] = Field(default_factory=list, description="Pipeline files and stages affected")
     remaining_risks: Optional[str] = Field(None, description="Remaining uncertainty or operational risks")
     next_steps: List[str] = Field(default_factory=list, description="Recommended production actions or monitoring")
+
+    @field_validator("affected_components", "next_steps", mode="before")
+    @classmethod
+    def none_to_empty_list(cls, v):
+        if v is None:
+            return []
+        return v
 
 
 class InvestigationSummary(BaseModel):
@@ -110,5 +131,12 @@ class AgentDecision(BaseModel):
     def empty_dict_to_none(cls, v):
         if isinstance(v, dict) and not v:
             return None
+        return v
+
+    @field_validator("hypotheses", "new_evidence", mode="before")
+    @classmethod
+    def none_to_empty_list(cls, v):
+        if v is None:
+            return []
         return v
 

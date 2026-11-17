@@ -1186,3 +1186,98 @@ async def test_call_tool_propose_patch_persists_proposal_and_pauses_at_gate(
         assert reports == []
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_propose_patch_decision_with_empty_dict_tool_call_and_final_report_succeeds(
+    tmp_path: Path, monkeypatch
+):
+    """
+    Regression test for investigation failure where LLM outputs empty dicts {}
+    for unused tool_call and final_report when proposing a patch.
+    Verifies that AgentDecision parses correctly and the engine transitions to awaiting_patch_approval.
+    """
+    engine, session_factory = await _create_isolated_db(tmp_path / "empty_dicts_patch.db")
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    monkeypatch.setattr(settings, "UPLOADS_DIR", uploads_dir)
+
+    raw_ai_payload = {
+        "investigation_summary": {
+            "investigation_focus": "KeyError during monthly spend aggregation",
+            "tool_selection_reason": "Sufficient evidence gathered",
+            "finding_summary": "Schema drift confirmed",
+            "hypothesis_impact": "Hypothesis confirmed",
+            "next_steps": "Propose patch to handle client_id",
+            "conclusion_rationale": "Clear root cause"
+        },
+        "current_stage": "hypothesis_generation",
+        "hypotheses": [{
+            "id": "HYP-01",
+            "title": "Schema Drift Causing KeyError",
+            "description": "Column renamed",
+            "status": "confirmed",
+            "confidence": 0.9,
+            "reasoning": "Observed in schema diff"
+        }],
+        "new_evidence": [],
+        "action_type": "propose_patch",
+        "tool_call": {},
+        "patch_proposal": {
+            "target_file": "pipeline.py",
+            "original_code_context": "    return total / count",
+            "proposed_code": "    return total / count if count else 0.0",
+            "unified_diff": "--- a/pipeline.py\n+++ b/pipeline.py\n@@ -1,1 +1,1 @@\n-    return total / count\n+    return total / count if count else 0.0",
+            "explanation": "Fix zero division",
+            "supporting_evidence_ids": None,
+            "expected_impact": "Fixes crash",
+            "potential_risks": "None"
+        },
+        "final_report": {},
+        "confidence_score": 0.9,
+        "confidence_justification": "Evidence backed"
+    }
+
+    # Verify Pydantic schema validation succeeds with empty dicts
+    parsed_decision = AgentDecision(**raw_ai_payload)
+    assert parsed_decision.tool_call is None
+    assert parsed_decision.final_report is None
+    assert parsed_decision.patch_proposal is not None
+    assert parsed_decision.patch_proposal.supporting_evidence_ids == []
+
+    class _EmptyDictsAI(AIProvider):
+        async def generate_decision(self, prompt: str, system_instruction: str = "", temperature: float = 0.2):
+            return parsed_decision
+
+    async with session_factory() as db:
+        proj, _ = await _seed_project_with_bug(db, uploads_dir, project_id="proj-empty-dicts")
+        inv = Investigation(project_id=proj.id, objective="Fix bug with empty dicts in decision payload")
+        db.add(inv)
+        await db.commit()
+
+        events_emitted = []
+        inv_engine = InvestigationEngine(
+            db=db,
+            investigation_id=inv.id,
+            ai_provider=_EmptyDictsAI(),
+            event_callback=lambda ev: events_emitted.append(ev)
+        )
+        await inv_engine.run()
+
+        await db.refresh(inv)
+        assert inv.status == "awaiting_patch_approval"
+        assert inv.stage == "awaiting_approval"
+
+        patches = (
+            await db.execute(select(PatchProposal).where(PatchProposal.investigation_id == inv.id))
+        ).scalars().all()
+        assert len(patches) == 1
+        assert patches[0].status == "proposed"
+        assert "if count else 0.0" in patches[0].proposed_code
+
+        patch_events = [e for e in events_emitted if e.get("event_type") == "patch_generated"]
+        assert len(patch_events) == 1
+        assert patch_events[0]["payload"]["patch_id"] == patches[0].id
+
+    await engine.dispose()
+
