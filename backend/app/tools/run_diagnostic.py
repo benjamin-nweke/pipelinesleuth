@@ -56,10 +56,14 @@ class RunDiagnosticTool(BaseDiagnosticTool):
                 execution_time_ms=int((time.time() - start_time) * 1000)
             )
 
-        # Run inside sandbox
+        # Run inside sandbox (normalize pytest to python -m pytest so project root is in sys.path)
+        cmd_to_run = list(command)
+        if cmd_to_run and cmd_to_run[0] == "pytest":
+            cmd_to_run = ["python", "-m", "pytest"] + cmd_to_run[1:]
+
         res = await sandbox_manager.run_in_sandbox(
             workspace_path=project_path,
-            command=command,
+            command=cmd_to_run,
             timeout_seconds=self.timeout_seconds
         )
 

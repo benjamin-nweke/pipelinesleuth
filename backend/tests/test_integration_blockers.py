@@ -1281,3 +1281,70 @@ async def test_propose_patch_decision_with_empty_dict_tool_call_and_final_report
 
     await engine.dispose()
 
+
+@pytest.mark.asyncio
+async def test_sandbox_docker_command_includes_pythonpath_workspace():
+    """Verifies that SandboxManager includes PYTHONPATH=/workspace to resolve top-level modules."""
+    import inspect
+    from backend.app.sandbox.manager import sandbox_manager
+    src = inspect.getsource(sandbox_manager.run_in_sandbox)
+    assert "-e" in src
+    assert "PYTHONPATH=/workspace" in src
+
+
+@pytest.mark.asyncio
+async def test_validate_patch_normalizes_pytest_command(tmp_path: Path, monkeypatch):
+    """Verifies that ValidatePatchTool normalizes pytest to python -m pytest."""
+    from typing import List, Optional
+    from backend.app.tools.validate_patch import ValidatePatchTool
+    from backend.app.tools.base import ToolResult
+
+    recorded_commands = []
+
+    async def fake_run_in_sandbox(workspace_path: str, command: List[str], timeout_seconds: Optional[int] = None):
+        recorded_commands.append(list(command))
+        return {
+            "success": True,
+            "exit_code": 0,
+            "stdout": "1 passed in 0.1s",
+            "stderr": "",
+            "docker_available": True,
+            "execution_time_ms": 100,
+            "error": None
+        }
+
+    monkeypatch.setattr("backend.app.tools.validate_patch.sandbox_manager.run_in_sandbox", fake_run_in_sandbox)
+
+    # Setup dummy project
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    (proj_dir / "pipeline.py").write_text("x = 1\n", encoding="utf-8")
+
+    tool = ValidatePatchTool()
+
+    # Case A: Default test_command (omitted)
+    res_default = await tool.execute(
+        project_path=str(proj_dir),
+        arguments={
+            "target_file": "pipeline.py",
+            "original_snippet": "x = 1\n",
+            "replacement_code": "x = 2\n",
+        }
+    )
+    assert res_default.success is True
+    assert recorded_commands[-1][:3] == ["python", "-m", "pytest"]
+
+    # Case B: Explicit ['pytest'] passed
+    res_explicit = await tool.execute(
+        project_path=str(proj_dir),
+        arguments={
+            "target_file": "pipeline.py",
+            "original_snippet": "x = 1\n",
+            "replacement_code": "x = 2\n",
+            "test_command": ["pytest", "tests/test_pipeline.py"]
+        }
+    )
+    assert res_explicit.success is True
+    assert recorded_commands[-1] == ["python", "-m", "pytest", "tests/test_pipeline.py"]
+
+

@@ -77,7 +77,7 @@ class ProposePatchTool(BaseDiagnosticTool):
 
     async def execute(self, project_path: str, arguments: Dict[str, Any]) -> ToolResult:
         start_time = time.time()
-        base_dir = Path(project_path)
+        base_dir = Path(project_path).resolve()
         target_file_rel = arguments.get("target_file", "")
         original_snippet = arguments.get("original_snippet", "")
         replacement_code = arguments.get("replacement_code", "")

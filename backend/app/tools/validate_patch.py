@@ -120,9 +120,9 @@ class ValidatePatchTool(BaseDiagnosticTool):
                 ToolParameter(
                     name="test_command",
                     type="array",
-                    description="Command to run in sandbox to validate fix (e.g. ['pytest'] or ['python', 'pipeline.py']).",
+                    description="Command to run in sandbox to validate fix (e.g. ['python', '-m', 'pytest'] or ['python', 'pipeline.py']).",
                     required=False,
-                    default=["pytest"]
+                    default=["python", "-m", "pytest"]
                 )
             ],
             permission_level=self.permission_level,
@@ -157,7 +157,11 @@ class ValidatePatchTool(BaseDiagnosticTool):
         target_file_rel = arguments.get("target_file", "")
         original_snippet = arguments.get("original_snippet", "")
         replacement_code = arguments.get("replacement_code", "")
-        test_cmd = arguments.get("test_command", ["pytest"])
+        test_cmd = arguments.get("test_command", ["python", "-m", "pytest"])
+        if not test_cmd:
+            test_cmd = ["python", "-m", "pytest"]
+        elif isinstance(test_cmd, list) and test_cmd and test_cmd[0] == "pytest":
+            test_cmd = ["python", "-m", "pytest"] + test_cmd[1:]
 
         if not isinstance(original_snippet, str) or not original_snippet.strip():
             return ToolResult(

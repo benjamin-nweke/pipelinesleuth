@@ -572,7 +572,7 @@ class PrivilegedValidationService:
                 "target_file": patch.target_file,
                 "original_snippet": patch.original_code_context or "",
                 "replacement_code": patch.proposed_code or "",
-                "test_command": test_command or ["pytest"]
+                "test_command": test_command or ["python", "-m", "pytest"]
             }
 
             tool_result = await val_tool.execute(

@@ -150,6 +150,7 @@ class SandboxManager:
             "--cpus", "1.0",
             "--read-only",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "-e", "PYTHONPATH=/workspace",
             "-v", f"{workspace_resolved}:/workspace:rw",
             "-w", "/workspace",
             self.docker_image
